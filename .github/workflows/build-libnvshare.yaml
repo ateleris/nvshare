@@ -12,7 +12,6 @@ jobs:
     with:
       actor: ${{ github.actor }}
       dockerfile: Dockerfile.libnvshare
-      imageName: nvshare-libnvshare
-      imageTag: latest
+      imageTag: libnvshare-latest
     secrets:
       ghToken: ${{ secrets.GITHUB_TOKEN }}

@@ -12,7 +12,6 @@ jobs:
     with:
       actor: ${{ github.actor }}
       dockerfile: Dockerfile.device_plugin
-      imageName: nvshare-device-plugin
-      imageTag: latest
+      imageTag: device-plugin-latest
     secrets:
       ghToken: ${{ secrets.GITHUB_TOKEN }}

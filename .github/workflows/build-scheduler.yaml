@@ -12,7 +12,6 @@ jobs:
     with:
       actor: ${{ github.actor }}
       dockerfile: Dockerfile.scheduler
-      imageName: nvshare-scheduler
-      imageTag: latest
+      imageTag: scheduler-latest
     secrets:
       ghToken: ${{ secrets.GITHUB_TOKEN }}
