@@ -29,7 +29,7 @@ spec:
       priorityClassName: system-node-critical
       containers:
       - name: nvshare-scheduler
-        image: docker.io/grgalex/nvshare:nvshare-scheduler-v0.1-8c2f5b90
+        image: ghcr.io/ateleris/nvshare:scheduler-latest
         imagePullPolicy: IfNotPresent
         securityContext:
           allowPrivilegeEscalation: false
