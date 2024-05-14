@@ -9,6 +9,8 @@ RUN make libnvshare.so
 
 FROM 12.4.1-runtime-ubuntu22.04
 
+ENV NVSHARE_DEBUG=1
+
 COPY --from=build /src/libnvshare.so /libnvshare.so
 ENV LD_PRELOAD=/libnvshare.so
 
