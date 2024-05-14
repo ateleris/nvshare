@@ -7,14 +7,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make
 RUN make libnvshare.so
 
-FROM 12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV NVSHARE_DEBUG=1
 
 COPY --from=build /src/libnvshare.so /libnvshare.so
 ENV LD_PRELOAD=/libnvshare.so
 
-COPY cuda-matmul.cu /cuda-matmul.cu
+COPY tests/cuda-matmul.cu /cuda-matmul.cu
 
 RUN nvcc -o /cuda-matmul /cuda-matmul.cu
 
