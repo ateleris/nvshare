@@ -39,6 +39,8 @@
 #define cuMemcpyHtoDAsync           cuMemcpyHtoDAsync_v2
 #define cuMemcpyDtoHAsync           cuMemcpyDtoHAsync_v2
 #define cuMemcpyDtoDAsync           cuMemcpyDtoDAsync_v2
+#define cuMemAllocAsync             cuMemAllocAsync_v2
+#define cuMemFreeAsync              cuMemFreeAsync_v2
 
 #define nvmlInit                    nvmlInit_v2
 #define nvmlDeviceGetHandleByIndex  nvmlDeviceGetHandleByIndex_v2
@@ -140,6 +142,9 @@ typedef CUresult (*cuMemcpyHtoDAsync_func)(CUdeviceptr dstDevice,
 	const void* srcHost, size_t ByteCount, CUstream hStream);
 typedef CUresult (*cuMemcpyDtoDAsync_func)(CUdeviceptr dstDevice,
 	CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
+typedef CUresult (*cuMemAllocAsync_func)(CUdeviceptr *dptr, size_t bytesize,
+	CUstream hStream);
+typedef CUresult (*cuMemFreeAsync_func)(CUdeviceptr dptr, CUstream hStream);
 
 typedef nvmlReturn_t (*nvmlDeviceGetUtilizationRates_func)(nvmlDevice_t device,
 	nvmlUtilization_t *utilization);
@@ -179,6 +184,9 @@ extern CUresult cuMemcpyHtoDAsync(CUdeviceptr dstDevice,
 	const void* srcHost, size_t ByteCount, CUstream hStream);
 extern CUresult cuMemcpyDtoDAsync(CUdeviceptr dstDevice,
 	CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
+extern CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize,
+	CUstream hStream);
+extern CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream);
 
 /* Real CUDA functions */
 extern cuGetProcAddress_func real_cuGetProcAddress;
@@ -201,6 +209,8 @@ extern cuMemcpyHtoD_func real_cuMemcpyHtoD;
 extern cuMemcpyHtoDAsync_func real_cuMemcpyHtoDAsync;
 extern cuMemcpyDtoD_func real_cuMemcpyDtoD;
 extern cuMemcpyDtoDAsync_func real_cuMemcpyDtoDAsync;
+extern cuMemAllocAsync_func real_cuMemAllocAsync;
+extern cuMemFreeAsync_func real_cuMemFreeAsync;
 
 extern void cuda_driver_check_error(CUresult err, const char *func_name);
 

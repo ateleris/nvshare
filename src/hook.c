@@ -59,6 +59,8 @@ cuMemcpyHtoD_func real_cuMemcpyHtoD = NULL;
 cuMemcpyHtoDAsync_func real_cuMemcpyHtoDAsync = NULL;
 cuMemcpyDtoD_func real_cuMemcpyDtoD = NULL;
 cuMemcpyDtoDAsync_func real_cuMemcpyDtoDAsync = NULL;
+cuMemAllocAsync_func real_cuMemAllocAsync = NULL;
+cuMemFreeAsync_func real_cuMemFreeAsync = NULL;
 cuGetProcAddress_func real_cuGetProcAddress = NULL;
 cuGetProcAddress_v2_func real_cuGetProcAddress_v2 = NULL;
 cuMemAllocManaged_func real_cuMemAllocManaged = NULL;
@@ -266,6 +268,16 @@ static void bootstrap_cuda(void)
 	error = dlerror();
 	if (error != NULL)
 		log_fatal("%s", error);
+	real_cuMemAllocAsync = (cuMemAllocAsync_func)
+		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemAllocAsync));
+	error = dlerror();
+	if (error != NULL)
+		log_fatal("%s", error);
+	real_cuMemFreeAsync = (cuMemFreeAsync_func)
+		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemFreeAsync));
+	error = dlerror();
+	if (error != NULL)
+		log_fatal("%s", error);
 }
 
 
@@ -433,7 +445,11 @@ void *dlsym_225(void *handle, const char *symbol)
 {
 	if (strncmp(symbol, "cu", 2) != 0) {
 		return (real_dlsym_225(handle, symbol));
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAlloc)) == 0) {
+	} 
+	
+	log_debug("dlsym_225 for symbol %s requested", symbol);
+
+	if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAlloc)) == 0) {
 		return (void *)(&cuMemAlloc);
 	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFree)) == 0) {
 		return (void *)(&cuMemFree);
@@ -463,6 +479,10 @@ void *dlsym_225(void *handle, const char *symbol)
 		return (void *)(&cuMemcpyDtoD);
 	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoDAsync)) == 0) {
 		return (void *)(&cuMemcpyDtoDAsync);
+	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAllocAsync)) == 0) {
+		return (void *)(&cuMemAllocAsync);
+	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFreeAsync)) == 0) {
+		return (void *)(&cuMemFreeAsync);
 	}
 
 	return (real_dlsym_225(handle, symbol));
@@ -472,7 +492,11 @@ void *dlsym_234(void *handle, const char *symbol)
 {
 	if (strncmp(symbol, "cu", 2) != 0) {
 		return (real_dlsym_234(handle, symbol));
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAlloc)) == 0) {
+	} 
+	
+	log_debug("dlsym_234 for symbol %s requested", symbol);
+
+	if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAlloc)) == 0) {
 		return (void *)(&cuMemAlloc);
 	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFree)) == 0) {
 		return (void *)(&cuMemFree);
@@ -502,6 +526,10 @@ void *dlsym_234(void *handle, const char *symbol)
 		return (void *)(&cuMemcpyDtoD);
 	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoDAsync)) == 0) {
 		return (void *)(&cuMemcpyDtoDAsync);
+	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAllocAsync)) == 0) {
+		return (void *)(&cuMemAllocAsync);
+	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFreeAsync)) == 0) {
+		return (void *)(&cuMemFreeAsync);
 	}
 
 	return (real_dlsym_234(handle, symbol));
@@ -529,6 +557,8 @@ void *dlsym_234(void *handle, const char *symbol)
 CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
 	cuuint64_t flags)
 {
+	log_debug("cuGetProcAddress for symbol %s requested with cudaVersion %d",
+		  symbol, cudaVersion);
 	/*
 	* cuGetProcAddress() will be called before cuInit() in CUDA
 	* Runtime API (version >=11.3), so cuGetProcAddress() should also
@@ -572,6 +602,10 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
 		*pfn = (void *)(&cuMemcpyDtoD);
 	} else if (strcmp(symbol, "cuMemcpyDtoDAsync") == 0) {
 		*pfn = (void *)(&cuMemcpyDtoDAsync);
+	} else if (strcmp(symbol, "cuMemAllocAsync") == 0) {
+		*pfn = (void *)(&cuMemAllocAsync);
+	} else if (strcmp(symbol, "cuMemFreeAsync") == 0) {
+		*pfn = (void *)(&cuMemFreeAsync);
 	} else {
 		result = real_cuGetProcAddress(symbol, pfn, cudaVersion, flags);
 	}
@@ -583,6 +617,7 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
 CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
 	cuuint64_t flags, CUdriverProcAddressQueryResult *symbolStatus)
 {
+	log_debug("cuGetProcAddress_v2 requested");
 	/*
 	* cuGetProcAddress_v2() will be called before cuInit() in CUDA
 	* Runtime API (version >=12.0), so cuGetProcAddress_v2()
@@ -634,9 +669,13 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
 		*pfn = (void *)(&cuMemcpyDtoD);
 	} else if (strcmp(symbol, "cuMemcpyDtoDAsync") == 0) {
 		*pfn = (void *)(&cuMemcpyDtoDAsync);
+	} else if (strcmp(symbol, "cuMemAllocAsync") == 0) {
+		*pfn = (void *)(&cuMemAllocAsync);
+	} else if (strcmp(symbol, "cuMemFreeAsync") == 0) {
+		*pfn = (void *)(&cuMemFreeAsync);
 	} else {
 		result = real_cuGetProcAddress_v2(symbol, pfn, cudaVersion,
-				                  flags, symbolStatus);
+					flags, symbolStatus);
 	}
 
 	return result;
@@ -645,6 +684,7 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
 
 CUresult cuMemAlloc(CUdeviceptr *dptr, size_t bytesize)
 {
+	log_debug("cuMemAlloc requested");
 	static int got_max_mem_size = 0;
 	size_t junk;
 	CUresult result = CUDA_SUCCESS;
@@ -684,6 +724,7 @@ CUresult cuMemAlloc(CUdeviceptr *dptr, size_t bytesize)
 
 CUresult cuMemFree(CUdeviceptr dptr)
 {
+	log_debug("cuMemFree requested");
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -697,6 +738,7 @@ CUresult cuMemFree(CUdeviceptr dptr)
 
 CUresult cuMemGetInfo(size_t *free, size_t *total)
 {
+	log_debug("cuMemGetInfo requested");
 	long long reserve_mib;
 	CUresult result = CUDA_SUCCESS;
 
@@ -751,6 +793,7 @@ CUresult cuMemGetInfo(size_t *free, size_t *total)
  */
 CUresult cuInit(unsigned int flags)
 {
+	log_debug("cuInit requested");
 	CUresult result = CUDA_SUCCESS;
 
 	true_or_exit(pthread_once(&init_libnvshare_done, initialize_libnvshare) == 0);
@@ -769,6 +812,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX,
 	unsigned int sharedMemBytes, CUstream hStream, void **kernelParams,
 	void **extra)
 {
+	log_debug("cuLaunchKernel requested");
 	CUresult result = CUDA_SUCCESS;
 
 	/* Return immediately if not initialized */
@@ -846,6 +890,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX,
  */
 CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount)
 {
+	log_debug("cuMemcpy requested %zu bytes", ByteCount);
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -862,6 +907,7 @@ CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount)
 CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount,
 	CUstream hStream)
 {
+	log_debug("cuMemcpyAsync requested %zu bytes", ByteCount);
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -877,6 +923,7 @@ CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount,
 
 CUresult cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount)
 {
+	log_debug("cuMemcpyDtoH requested %zu bytes", ByteCount);
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -893,6 +940,7 @@ CUresult cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount)
 CUresult cuMemcpyDtoHAsync(void* dstHost, CUdeviceptr srcDevice,
 	size_t ByteCount, CUstream hStream)
 {
+	log_debug("cuMemcpyDtoHAsync requested %zu bytes", ByteCount);
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -909,6 +957,7 @@ CUresult cuMemcpyDtoHAsync(void* dstHost, CUdeviceptr srcDevice,
 CUresult cuMemcpyHtoD(CUdeviceptr dstDevice, const void* srcHost,
 	size_t ByteCount)
 {
+	log_debug("cuMemcpyHtoD requested %zu bytes", ByteCount);
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -925,6 +974,7 @@ CUresult cuMemcpyHtoD(CUdeviceptr dstDevice, const void* srcHost,
 CUresult cuMemcpyHtoDAsync(CUdeviceptr dstDevice, const void* srcHost,
 	size_t ByteCount, CUstream hStream)
 {
+	log_debug("cuMemcpyHtoDAsync requested %zu bytes", ByteCount);
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -941,6 +991,7 @@ CUresult cuMemcpyHtoDAsync(CUdeviceptr dstDevice, const void* srcHost,
 CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
 	size_t ByteCount)
 {
+	log_debug("cuMemcpyDtoD requested %zu bytes", ByteCount);
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -957,6 +1008,7 @@ CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
 CUresult cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
 	size_t ByteCount, CUstream hStream)
 {
+	log_debug("cuMemcpyDtoDAsync requested %zu bytes", ByteCount);
 	CUresult result = CUDA_SUCCESS;
 
 
@@ -966,6 +1018,22 @@ CUresult cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
 	continue_with_lock();
 	result = real_cuMemcpyDtoDAsync(dstDevice, srcDevice, ByteCount, hStream);
 	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpyDtoDAsync));
+
+	return result;
+}
+
+CUresult cuMemAllocAsync_func(CUdeviceptr *dptr, size_t bytesize, CUstream hStream) 
+{
+	log_debug("cuMemAllocAsync requested %zu bytes", bytesize);
+	CUresult result = CUDA_SUCCESS;
+
+	return result;
+}
+
+CUresult cuMemFreeAsync_func(CUdeviceptr dptr, CUstream hStream) 
+{
+	log_debug("cuMemFreeAsync requested");
+	CUresult result = CUDA_SUCCESS;
 
 	return result;
 }
