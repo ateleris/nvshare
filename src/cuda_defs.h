@@ -39,8 +39,8 @@
 #define cuMemcpyHtoDAsync           cuMemcpyHtoDAsync_v2
 #define cuMemcpyDtoHAsync           cuMemcpyDtoHAsync_v2
 #define cuMemcpyDtoDAsync           cuMemcpyDtoDAsync_v2
-#define cuMemAllocAsync             cuMemAllocAsync_v2
-#define cuMemFreeAsync              cuMemFreeAsync_v2
+#define cuMemAllocAsync             cuMemAllocAsync
+#define cuMemFreeAsync              cuMemFreeAsync
 
 #define nvmlInit                    nvmlInit_v2
 #define nvmlDeviceGetHandleByIndex  nvmlDeviceGetHandleByIndex_v2
