@@ -1024,8 +1024,39 @@ CUresult cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
 
 CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream) 
 {
-	log_debug("cuMemAllocAsync requested %zu bytes", bytesize);
+	log_debug("cuMemAllocAsync requested");
+	static int got_max_mem_size = 0;
+	size_t junk;
 	CUresult result = CUDA_SUCCESS;
+
+
+	/* Return immediately if not initialized */
+	if (real_cuMemAllocManaged == NULL) return CUDA_ERROR_NOT_INITIALIZED;
+
+	if (got_max_mem_size == 0) {
+		result = cuMemGetInfo(&nvshare_size_mem_allocatable, &junk);
+		cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemGetInfo));
+		got_max_mem_size = 1;
+	}
+
+	if ((sum_allocated + bytesize) > nvshare_size_mem_allocatable) {
+		if (enable_single_oversub == 0) {
+			return CUDA_ERROR_OUT_OF_MEMORY;
+		} else {
+			log_warn("Memory allocations exceeded physical GPU"
+				 " memory capacity. This can cause extreme"
+				 " performance degradation!");
+		}
+	}
+
+	log_debug("cuMemAllocAsync requested %zu bytes", bytesize);
+	result = real_cuMemAllocManaged(dptr, bytesize, CU_MEM_ATTACH_GLOBAL);
+	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemAllocManaged));
+	log_debug("cuMemAllocManaged allocated %zu bytes at 0x%llx",
+		bytesize, *dptr);
+	if (result == CUDA_SUCCESS) {
+		insert_cuda_allocation(*dptr, bytesize);
+	}
 
 	return result;
 }
@@ -1034,6 +1065,10 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream)
 {
 	log_debug("cuMemFreeAsync requested");
 	CUresult result = CUDA_SUCCESS;
+
+	if (real_cuMemFree == NULL) return CUDA_ERROR_NOT_INITIALIZED;
+	result = real_cuMemFree(dptr);
+	if (result == CUDA_SUCCESS) remove_cuda_allocation(dptr);
 
 	return result;
 }
