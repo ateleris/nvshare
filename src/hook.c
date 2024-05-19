@@ -41,6 +41,7 @@
 #include "utlist.h"
 
 #define ENV_NVSHARE_ENABLE_SINGLE_OVERSUB  "NVSHARE_ENABLE_SINGLE_OVERSUB"
+#define ENV_NVSHARE_HIDE_MEMINFO_RESERVE_MIB "NVSHARE_HIDE_MEMINFO_RESERVE_MIB"
 
 #define MEMINFO_RESERVE_MIB 1536           /* MiB */
 #define KERN_SYNC_DURATION_BIG 10          /* seconds */
@@ -84,6 +85,7 @@ int pending_kernel_window = 1;
 pthread_mutex_t kcount_mutex;
 
 int enable_single_oversub = 0;
+int hide_meminfo_reserve_mib = 0;
 int nvml_ok = 1;
 
 /* Representation of a CUDA memory allocation */
@@ -329,6 +331,11 @@ static void initialize_libnvshare(void)
 		enable_single_oversub = 1;
 		log_warn("Enabling GPU memory oversubscription for this"
 		         " application");
+	}
+	value = getenv(ENV_NVSHARE_HIDE_MEMINFO_RESERVE_MIB);
+	if (value != NULL) {
+		hide_meminfo_reserve_mib = 1;
+		log_warn("Hiding %d MiB from CUDA memory info", MEMINFO_RESERVE_MIB);
 	}
 
 	bootstrap_cuda();
@@ -781,6 +788,10 @@ CUresult cuMemGetInfo(size_t *free, size_t *total)
 	 */
 	reserve_mib = (MEMINFO_RESERVE_MIB) MiB;
 	*free = *total - (size_t) reserve_mib;
+
+	if (hide_meminfo_reserve_mib == 1) {
+		*total -= reserve_mib;
+	}
 
 	log_debug("nvshare's cuMemGetInfo returning free=%.2f MiB,"
 		  " total=%.2f MiB", toMiB(*free), toMiB(*total));
