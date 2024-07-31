@@ -17,7 +17,7 @@ NVSHARE_TAG := $(shell echo $(NVSHARE_COMMIT) | cut -c 1-8)
 CC = gcc
 GENERAL_LDFLAGS = -Wl,-z,defs -Wl,-z,relro -Wl,-z,now -Wl,--no-undefined
 LIBNVSHARE_LDFLAGS = -shared -Wl,-soname=libnvshare.so -Wl,--version-script=libnvshare-symbols.ld -Wl,--exclude-libs,ALL
-LIBNVSHARE_LDLIBS = -ldl -lpthread
+LIBNVSHARE_LDLIBS = -ldl -lpthread -static-libgcc -static-libstdc++
 SCHEDULER_LDLIBS = -lpthread
 CFLAGS = -O3 -Wall -Wextra -std=gnu99 -fPIC -D_FORTIFY_SOURCE=2
 
