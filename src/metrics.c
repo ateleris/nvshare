@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #include "metrics.h"
 #include "common.h"
@@ -191,7 +192,7 @@ int metrics_register_session(const struct nvshare_client *client, const char *de
 	pthread_mutex_unlock(&metrics_mutex);
 	
 	memset(&msg, 0, sizeof(msg));
-	msg.type = METRICS_SESSION_START;
+	msg.type = (int32_t)METRICS_SESSION_START;
 	strlcpy(msg.namespace, client->pod_namespace, sizeof(msg.namespace));
 	strlcpy(msg.pod_name, client->pod_name, sizeof(msg.pod_name));
 	strlcpy(msg.container, "container", sizeof(msg.container));
@@ -229,7 +230,7 @@ int metrics_unregister_session(const struct nvshare_client *client, const char *
 			LL_DELETE(active_sessions, session);
 			
 			memset(&msg, 0, sizeof(msg));
-			msg.type = METRICS_SESSION_END;
+			msg.type = (int32_t)METRICS_SESSION_END;
 			strlcpy(msg.namespace, session->namespace, sizeof(msg.namespace));
 			strlcpy(msg.pod_name, session->pod_name, sizeof(msg.pod_name));
 			strlcpy(msg.container, session->container, sizeof(msg.container));

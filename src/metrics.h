@@ -27,14 +27,14 @@ enum metrics_message_type {
 } __attribute__((__packed__));
 
 struct metrics_message {
-	enum metrics_message_type type;
+	int32_t type;
 	char namespace[POD_NAMESPACE_LEN_MAX];
 	char pod_name[POD_NAME_LEN_MAX];
 	char container[128];
 	char device_id[MAX_DEVICE_ID_LEN];
-	int process_id;
+	int32_t process_id;
 	uint64_t client_id;
-	time_t timestamp;
+	int64_t timestamp;
 } __attribute__((__packed__));
 
 int metrics_init(void);
