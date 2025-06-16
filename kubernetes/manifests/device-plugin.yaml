@@ -63,13 +63,23 @@ spec:
         env:
         - name: NVSHARE_VIRTUAL_DEVICES
           value: "10"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+        ports:
+        - containerPort: 8080
+          name: metrics
+          protocol: TCP
         volumeMounts:
           - name: device-plugin-socket
             mountPath: /var/lib/kubelet/device-plugins
+          - name: host-var-run-nvshare
+            mountPath: /var/run/nvshare
         resources:
           limits:
             nvidia.com/gpu: 1

@@ -32,6 +32,8 @@
 #include "comm.h"
 #include "common.h"
 #include "utlist.h"
+#include "nvshare_types.h"
+#include "metrics.h"
 
 #define NVSHARE_DEFAULT_TQ 30
 
@@ -51,20 +53,6 @@ pthread_mutex_t global_mutex;
 /* File descriptor for epoll */
 int epoll_fd;
 
-/* Necessary information for identifying an nvshare client */
-struct nvshare_client {
-	int fd; /* server-side socket for the persistent connection */
-	uint64_t id; /* Unique */
-	char pod_name[POD_NAME_LEN_MAX];
-	char pod_namespace[POD_NAMESPACE_LEN_MAX];
-	struct nvshare_client *next;
-};
-
-/* Holds the requests for the GPU lock, which we serve in an FCFS manner */
-struct nvshare_request {
-	struct nvshare_client *client;
-	struct nvshare_request *next;
-};
 
 struct nvshare_client *clients = NULL;
 struct nvshare_request *requests = NULL;
@@ -105,6 +93,8 @@ static void delete_client(struct nvshare_client *client)
 	client_id_as_string(id_str, sizeof(id_str), client->id);
 	log_info("Removing client %s", id_str);
 	remove_req(client);
+	
+	metrics_unregister_session(client, "nvidia0");
 
 	/* Remove from clients list */
 	LL_FOREACH_SAFE(clients, c, tmp) {
@@ -312,6 +302,8 @@ try_again:
 		lock_held = 1;
 		must_reset_timer = 1;
 		pthread_cond_broadcast(&timer_cv);
+		
+		metrics_register_session(requests->client, "nvidia0", -1);
 	}
 }
 
@@ -556,6 +548,8 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 
 	true_or_exit(pthread_mutex_init(&global_mutex, NULL) == 0);
 	true_or_exit(pthread_cond_init(&timer_cv, NULL) == 0);
+	
+	metrics_init();
 
 	if (nvshare_get_scheduler_path(nvscheduler_socket_path) != 0)
 		log_fatal("nvshare_get_scheduler_path() failed!");
@@ -668,6 +662,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	}
 
 	/* Control should never reach here */
+	metrics_cleanup();
 	return -1;
 }
 
