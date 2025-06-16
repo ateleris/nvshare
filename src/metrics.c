@@ -22,56 +22,69 @@ int metrics_init(void) {
 	int flags;
 	
 	if (metrics_socket >= 0) {
+		log_debug("Metrics socket already initialized");
 		return 0;
 	}
 	
+	log_info("Initializing metrics system...");
+	
 	metrics_socket = socket(AF_UNIX, SOCK_DGRAM, 0);
 	if (metrics_socket < 0) {
-		log_warn("Failed to create metrics socket: %s", strerror(errno));
+		log_warn("METRICS ERROR: Failed to create socket: %s", strerror(errno));
 		return -1;
 	}
+	log_debug("Created metrics socket fd=%d", metrics_socket);
 	
 	flags = fcntl(metrics_socket, F_GETFL, 0);
 	if (flags < 0 || fcntl(metrics_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
-		log_warn("Failed to set metrics socket to non-blocking: %s", strerror(errno));
+		log_warn("METRICS ERROR: Failed to set socket non-blocking: %s", strerror(errno));
 		close(metrics_socket);
 		metrics_socket = -1;
 		return -1;
 	}
+	log_debug("Set metrics socket to non-blocking mode");
 	
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	strlcpy(addr.sun_path, METRICS_SOCKET_PATH, sizeof(addr.sun_path));
+	log_debug("Connecting to metrics socket: %s", METRICS_SOCKET_PATH);
 	
 	if (connect(metrics_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-		log_debug("Metrics socket not available, metrics disabled: %s", strerror(errno));
+		log_warn("METRICS WARNING: Cannot connect to device plugin socket: %s", strerror(errno));
+		log_warn("METRICS WARNING: Metrics will be disabled until device plugin is available");
 		close(metrics_socket);
 		metrics_socket = -1;
 		return -1;
 	}
 	
-	log_info("Metrics system initialized");
+	log_info("METRICS SUCCESS: Connected to device plugin at %s", METRICS_SOCKET_PATH);
 	return 0;
 }
 
 static int send_metrics_message(const struct metrics_message *msg) {
 	if (metrics_socket < 0) {
+		log_debug("METRICS ERROR: Cannot send message - socket not initialized");
 		return -1;
 	}
+	
+	log_debug("METRICS: Sending message type %d for pod %s/%s", msg->type, msg->namespace, msg->pod_name);
 	
 	ssize_t sent = send(metrics_socket, msg, sizeof(*msg), MSG_DONTWAIT);
 	if (sent < 0) {
 		if (errno != EAGAIN && errno != EWOULDBLOCK) {
-			log_debug("Failed to send metrics message: %s", strerror(errno));
+			log_warn("METRICS ERROR: Failed to send message: %s", strerror(errno));
+		} else {
+			log_debug("METRICS: Socket busy, message dropped");
 		}
 		return -1;
 	}
 	
 	if (sent != sizeof(*msg)) {
-		log_debug("Partial metrics message sent");
+		log_warn("METRICS ERROR: Partial message sent (%zd/%zu bytes)", sent, sizeof(*msg));
 		return -1;
 	}
 	
+	log_info("METRICS SUCCESS: Sent %zd bytes to device plugin", sent);
 	return 0;
 }
 
@@ -127,12 +140,22 @@ int metrics_register_session(const struct nvshare_client *client, const char *de
 	struct metrics_message msg;
 	struct pod_gpu_session *session;
 	
-	if (!client || metrics_socket < 0) {
+	if (!client) {
+		log_warn("METRICS ERROR: Cannot register session - client is NULL");
 		return -1;
 	}
 	
+	if (metrics_socket < 0) {
+		log_debug("METRICS WARNING: Cannot register session - socket not connected");
+		return -1;
+	}
+	
+	log_info("METRICS: Registering GPU session for pod %s/%s on device %s", 
+		 client->pod_namespace, client->pod_name, device_id);
+	
 	if (process_id <= 0) {
 		process_id = get_process_id_from_client(client);
+		log_debug("METRICS: Resolved process_id to %d", process_id);
 	}
 	
 	pthread_mutex_lock(&metrics_mutex);
@@ -140,6 +163,7 @@ int metrics_register_session(const struct nvshare_client *client, const char *de
 	LL_FOREACH(active_sessions, session) {
 		if (session->client_id == client->id && 
 		    strcmp(session->device_id, device_id) == 0) {
+			log_debug("METRICS: Session already exists for client %lx", client->id);
 			pthread_mutex_unlock(&metrics_mutex);
 			return 0;
 		}
@@ -147,6 +171,7 @@ int metrics_register_session(const struct nvshare_client *client, const char *de
 	
 	session = malloc(sizeof(*session));
 	if (!session) {
+		log_warn("METRICS ERROR: Failed to allocate session memory");
 		pthread_mutex_unlock(&metrics_mutex);
 		return -1;
 	}
@@ -161,6 +186,7 @@ int metrics_register_session(const struct nvshare_client *client, const char *de
 	session->last_active = session->start_time;
 	
 	LL_APPEND(active_sessions, session);
+	log_debug("METRICS: Added session to active list (client_id=%lx)", client->id);
 	
 	pthread_mutex_unlock(&metrics_mutex);
 	
@@ -174,9 +200,13 @@ int metrics_register_session(const struct nvshare_client *client, const char *de
 	msg.client_id = client->id;
 	msg.timestamp = session->start_time;
 	
+	log_debug("METRICS: Prepared message for %s/%s", msg.namespace, msg.pod_name);
+	
 	if (send_metrics_message(&msg) == 0) {
-		log_debug("Registered GPU session for pod %s/%s on device %s", 
+		log_info("METRICS SUCCESS: Registered GPU session for pod %s/%s on device %s", 
 			  client->pod_namespace, client->pod_name, device_id);
+	} else {
+		log_warn("METRICS ERROR: Failed to send registration message");
 	}
 	
 	return 0;

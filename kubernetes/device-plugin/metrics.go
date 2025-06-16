@@ -379,41 +379,51 @@ type MetricsMessage struct {
 func (mc *MetricsCollector) startMetricsListener() {
 	socketPath := "/var/run/nvshare/metrics.sock"
 	
+	log.Printf("Starting metrics listener setup for %s", socketPath)
 	os.Remove(socketPath)
 	
 	addr, err := net.ResolveUnixAddr("unixgram", socketPath)
 	if err != nil {
-		log.Printf("Failed to resolve Unix address: %v", err)
+		log.Printf("ERROR: Failed to resolve Unix address: %v", err)
 		return
 	}
 	
 	conn, err := net.ListenUnixgram("unixgram", addr)
 	if err != nil {
-		log.Printf("Failed to listen on Unix socket: %v", err)
+		log.Printf("ERROR: Failed to listen on Unix socket: %v", err)
 		return
 	}
 	defer conn.Close()
 	
 	if err := os.Chmod(socketPath, 0666); err != nil {
-		log.Printf("Failed to chmod metrics socket: %v", err)
+		log.Printf("WARNING: Failed to chmod metrics socket: %v", err)
 	}
 	
-	log.Printf("Metrics listener started on %s", socketPath)
+	log.Printf("SUCCESS: Metrics listener started on %s", socketPath)
+	log.Printf("INFO: Waiting for metrics messages from scheduler...")
 	
 	buffer := make([]byte, 1024)
+	messageCount := 0
 	for {
+		log.Printf("DEBUG: Waiting for message on metrics socket...")
 		n, err := conn.Read(buffer)
 		if err != nil {
-			log.Printf("Error reading from metrics socket: %v", err)
+			log.Printf("ERROR: Reading from metrics socket failed: %v", err)
 			continue
 		}
+		
+		messageCount++
+		log.Printf("SUCCESS: Received message #%d from scheduler (size: %d bytes)", messageCount, n)
 		
 		mc.handleMetricsMessage(buffer[:n])
 	}
 }
 
 func (mc *MetricsCollector) handleMetricsMessage(data []byte) {
+	log.Printf("INFO: Processing metrics message (size: %d bytes)", len(data))
+	
 	if len(data) < 32 {
+		log.Printf("ERROR: Message too small (expected >=32, got %d bytes)", len(data))
 		return
 	}
 	
@@ -424,12 +434,20 @@ func (mc *MetricsCollector) handleMetricsMessage(data []byte) {
 	container := strings.TrimRight(string(msg.Container[:]), "\x00")
 	deviceID := strings.TrimRight(string(msg.DeviceID[:]), "\x00")
 	
+	log.Printf("PARSED MESSAGE: type=%d, namespace=%s, pod=%s, container=%s, device=%s, pid=%d, client=%d", 
+		msg.Type, namespace, podName, container, deviceID, msg.ProcessID, msg.ClientID)
+	
 	switch msg.Type {
 	case 100: // METRICS_SESSION_START
+		log.Printf("SUCCESS: Processing SESSION_START for %s/%s", namespace, podName)
 		mc.RegisterPodSession(namespace, podName, container, deviceID, int(msg.ProcessID), msg.ClientID)
 	case 101: // METRICS_SESSION_END
+		log.Printf("SUCCESS: Processing SESSION_END for %s/%s", namespace, podName)
 		mc.UnregisterPodSession(namespace, podName, container, deviceID)
 	case 102: // METRICS_SESSION_UPDATE
+		log.Printf("INFO: Processing SESSION_UPDATE for %s/%s", namespace, podName)
 		// Update last active time - handled in periodic update
+	default:
+		log.Printf("WARNING: Unknown message type %d", msg.Type)
 	}
 }
