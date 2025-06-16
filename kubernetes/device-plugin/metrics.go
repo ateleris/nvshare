@@ -74,7 +74,22 @@ func NewMetricsCollector(port int) *MetricsCollector {
 	prometheus.MustRegister(mc.podGPUMemoryUsed)
 	prometheus.MustRegister(mc.podGPUSessionActive)
 	
+	mc.initializeDefaultMetrics()
+	
 	return mc
+}
+
+func (mc *MetricsCollector) initializeDefaultMetrics() {
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		nodeName = "unknown"
+	}
+	
+	mc.podGPUUtilization.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Set(0)
+	mc.podGPUMemoryUsed.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Set(0)
+	mc.podGPUSessionActive.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Set(0)
+	
+	log.Printf("Initialized default nvshare metrics for node %s", nodeName)
 }
 
 func (mc *MetricsCollector) StartMetricsServer() error {
