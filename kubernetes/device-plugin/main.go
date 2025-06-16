@@ -41,6 +41,7 @@ const (
 var UUID string
 var NvshareVirtualDevices int
 var nvidiaRuntimeUseMounts bool
+var metricsCollector *MetricsCollector
 
 func main() {
 	var exists bool
@@ -118,6 +119,11 @@ func main() {
 	}
 
 	log.Printf("Read UUID = %s", UUID)
+
+	metricsCollector = NewMetricsCollector(8080)
+	if err := metricsCollector.StartMetricsServer(); err != nil {
+		log.Printf("Failed to start metrics server: %v", err)
+	}
 
 	log.Println("Starting FS watcher.")
 	watcher, err := newFSWatcher(pluginapi.DevicePluginPath)
