@@ -35,9 +35,9 @@ type MetricsCollector struct {
 	schedulerConn   net.Conn
 	metricsPort     int
 	
-	podGPUUtilization *prometheus.GaugeVec
-	podGPUMemoryUsed  *prometheus.GaugeVec
-	podGPUSessionActive *prometheus.GaugeVec
+	podGPUUtilization *prometheus.CounterVec
+	podGPUMemoryUsed  *prometheus.CounterVec
+	podGPUSessionActive *prometheus.CounterVec
 }
 
 func NewMetricsCollector(port int) *MetricsCollector {
@@ -45,26 +45,26 @@ func NewMetricsCollector(port int) *MetricsCollector {
 		activeSessions: make(map[string]*PodGPUSession),
 		metricsPort:    port,
 		
-		podGPUUtilization: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: "nvshare_pod_gpu_utilization_percent",
-				Help: "GPU utilization percentage per pod",
+		podGPUUtilization: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "nvshare_pod_gpu_utilization_percent_total",
+				Help: "Total GPU utilization in percent-seconds per pod",
 			},
 			[]string{"namespace", "pod", "container", "gpu_device", "node"},
 		),
 		
-		podGPUMemoryUsed: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: "nvshare_pod_gpu_memory_used_bytes",
-				Help: "GPU memory used in bytes per pod",
+		podGPUMemoryUsed: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "nvshare_pod_gpu_memory_used_bytes_total",
+				Help: "Total GPU memory used in byte-seconds per pod",
 			},
 			[]string{"namespace", "pod", "container", "gpu_device", "node"},
 		),
 		
-		podGPUSessionActive: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: "nvshare_pod_gpu_session_active",
-				Help: "Whether pod has active GPU session (1=active, 0=inactive)",
+		podGPUSessionActive: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "nvshare_pod_gpu_session_seconds_total",
+				Help: "Total GPU session time in seconds per pod",
 			},
 			[]string{"namespace", "pod", "container", "gpu_device", "node"},
 		),
@@ -85,9 +85,9 @@ func (mc *MetricsCollector) initializeDefaultMetrics() {
 		nodeName = "unknown"
 	}
 	
-	mc.podGPUUtilization.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Set(0)
-	mc.podGPUMemoryUsed.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Set(0)
-	mc.podGPUSessionActive.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Set(0)
+	mc.podGPUUtilization.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Add(0)
+	mc.podGPUMemoryUsed.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Add(0)
+	mc.podGPUSessionActive.WithLabelValues("nvshare-system", "nvshare-device-plugin", "device-plugin", "nvidia0", nodeName).Add(0)
 	
 	log.Printf("Initialized default nvshare metrics for node %s", nodeName)
 }
@@ -162,13 +162,15 @@ func (mc *MetricsCollector) updateSessionMetric(session *PodGPUSession, active f
 		nodeName = "unknown"
 	}
 	
-	mc.podGPUSessionActive.WithLabelValues(
-		session.Namespace,
-		session.PodName,
-		session.Container,
-		session.DeviceID,
-		nodeName,
-	).Set(active)
+	if active > 0 {
+		mc.podGPUSessionActive.WithLabelValues(
+			session.Namespace,
+			session.PodName,
+			session.Container,
+			session.DeviceID,
+			nodeName,
+		).Add(30)
+	}
 }
 
 func (mc *MetricsCollector) clearUtilizationMetrics(session *PodGPUSession) {
@@ -216,7 +218,7 @@ func (mc *MetricsCollector) updateMetrics() {
 			session.Container,
 			session.DeviceID,
 			nodeName,
-		).Set(utilization)
+		).Add(utilization * 30)
 		
 		mc.podGPUMemoryUsed.WithLabelValues(
 			session.Namespace,
@@ -224,7 +226,7 @@ func (mc *MetricsCollector) updateMetrics() {
 			session.Container,
 			session.DeviceID,
 			nodeName,
-		).Set(memoryUsed)
+		).Add(memoryUsed * 30)
 	}
 }
 
