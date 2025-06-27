@@ -14,47 +14,41 @@
 #include "utlist.h"
 #include "comm.h"
 
-static int metrics_socket = -1;
+static int socket_fd = -1;
 static struct pod_gpu_session *active_sessions = NULL;
 static pthread_mutex_t metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int metrics_init(void) {
-	struct sockaddr_un addr;
-	int flags;
-	
-	if (metrics_socket >= 0) {
-		log_debug("Metrics socket already initialized");
-		return 0;
-	}
-	
 	log_info("Initializing metrics system...");
 	
-	metrics_socket = socket(AF_UNIX, SOCK_DGRAM, 0);
-	if (metrics_socket < 0) {
+	socket_fd = socket(AF_LOCAL, SOCK_DGRAM, 0);
+	if (socket_fd < 0) {
 		log_warn("METRICS ERROR: Failed to create socket: %s", strerror(errno));
 		return -1;
 	}
-	log_debug("Created metrics socket fd=%d", metrics_socket);
+	log_debug("Created metrics socket fd=%d", socket_fd);
 	
-	flags = fcntl(metrics_socket, F_GETFL, 0);
-	if (flags < 0 || fcntl(metrics_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
+	int flags;
+	flags = fcntl(socket_fd, F_GETFL, 0);
+	if (flags < 0 || fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
 		log_warn("METRICS ERROR: Failed to set socket non-blocking: %s", strerror(errno));
-		close(metrics_socket);
-		metrics_socket = -1;
+		close(socket_fd);
+		socket_fd = -1;
 		return -1;
 	}
 	log_debug("Set metrics socket to non-blocking mode");
 	
+	struct sockaddr_un addr;
 	memset(&addr, 0, sizeof(addr));
-	addr.sun_family = AF_UNIX;
+	addr.sun_family = AF_LOCAL;
 	strlcpy(addr.sun_path, METRICS_SOCKET_PATH, sizeof(addr.sun_path));
 	log_debug("Connecting to metrics socket: %s", METRICS_SOCKET_PATH);
 	
-	if (connect(metrics_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+	if (connect(socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
 		log_warn("METRICS WARNING: Cannot connect to device plugin socket: %s", strerror(errno));
 		log_warn("METRICS WARNING: Metrics will be disabled until device plugin is available");
-		close(metrics_socket);
-		metrics_socket = -1;
+		close(socket_fd);
+		socket_fd = -1;
 		return -1;
 	}
 	
@@ -63,14 +57,14 @@ int metrics_init(void) {
 }
 
 static int send_metrics_message(const struct metrics_message *msg) {
-	if (metrics_socket < 0) {
+	if (socket_fd < 0) {
 		log_debug("METRICS ERROR: Cannot send message - socket not initialized");
 		return -1;
 	}
 	
 	log_debug("METRICS: Sending message type %d for pod %s/%s", msg->type, msg->namespace, msg->pod_name);
 	
-	ssize_t sent = send(metrics_socket, msg, sizeof(*msg), MSG_DONTWAIT);
+	ssize_t sent = send(socket_fd, msg, sizeof(*msg), MSG_DONTWAIT);
 	if (sent < 0) {
 		if (errno != EAGAIN && errno != EWOULDBLOCK) {
 			log_warn("METRICS ERROR: Failed to send message: %s", strerror(errno));
@@ -89,6 +83,7 @@ static int send_metrics_message(const struct metrics_message *msg) {
 	return 0;
 }
 
+/*
 static char* extract_device_id_from_uuid(const char* uuid) {
 	static char device_id[MAX_DEVICE_ID_LEN];
 	
@@ -100,57 +95,57 @@ static char* extract_device_id_from_uuid(const char* uuid) {
 	
 	return device_id;
 }
+*/
 
 static int get_process_id_from_client(const struct nvshare_client *client) {
-	char proc_path[256];
-	char comm_path[256];
-	FILE *fp;
-	int pid = -1;
 	
-	snprintf(proc_path, sizeof(proc_path), "/proc/net/unix");
-	fp = fopen(proc_path, "r");
-	if (!fp) {
-		return -1;
-	}
-	
-	char line[512];
-	while (fgets(line, sizeof(line), fp)) {
-		char *token = strtok(line, " \t");
-		if (!token) continue;
-		
-		for (int i = 0; i < 6 && token; i++) {
-			token = strtok(NULL, " \t");
-		}
-		
-		if (token) {
-			int sock_inode = atoi(token);
-			
-			char search_path[256];
-			snprintf(search_path, sizeof(search_path), "/proc/*/fd/*");
-			
-			break;
-		}
-	}
-	
-	fclose(fp);
+	//FILE* fd = NULL;
+	//
+	//fd = fopen("/proc/net/unix", "r");
+	//if (!fd) {
+	//	return -1;
+	//}
+	//
+	//char line[512];
+	//while (fgets(line, sizeof(line), fd)) {
+	//	char *token = strtok(line, " \t");
+	//	if (!token) continue;
+	//	
+	//	for (int i = 0; i < 6 && token; i++) {
+	//		token = strtok(NULL, " \t");
+	//	}
+	//	
+	//	if (token) {
+	//		int sock_inode = atoi(token);
+	//		
+	//		char search_path[256];
+	//		snprintf(search_path, sizeof(search_path), "/proc/*/fd/*");
+	//		
+	//		break;
+	//	}
+	//}
+	//
+	//fclose(fd);
 	
 	return getpid();
 }
 
 int metrics_register_session(const struct nvshare_client *client, const char *device_id, int process_id) {
-	struct metrics_message msg;
-	struct pod_gpu_session *session;
-	
 	if (!client) {
 		log_warn("METRICS ERROR: Cannot register session - client is NULL");
 		return -1;
 	}
 	
-	if (metrics_socket < 0) {
+	if (socket_fd < 0) {
 		log_debug("METRICS WARNING: Cannot register session - socket not connected");
 		return -1;
 	}
-	
+
+	if (device_id == 0x00) {
+		log_warn("METRICS ERROR: Cannot register session - device id is empty string");
+		return -1;
+	}
+
 	log_info("METRICS: Registering GPU session for pod %s/%s on device %s", 
 		 client->pod_namespace, client->pod_name, device_id);
 	
@@ -161,6 +156,7 @@ int metrics_register_session(const struct nvshare_client *client, const char *de
 	
 	pthread_mutex_lock(&metrics_mutex);
 	
+	struct pod_gpu_session* session;
 	LL_FOREACH(active_sessions, session) {
 		if (session->client_id == client->id && 
 		    strcmp(session->device_id, device_id) == 0) {
@@ -191,6 +187,7 @@ int metrics_register_session(const struct nvshare_client *client, const char *de
 	
 	pthread_mutex_unlock(&metrics_mutex);
 	
+	struct metrics_message msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.type = (int32_t)METRICS_SESSION_START;
 	strlcpy(msg.namespace, client->pod_namespace, sizeof(msg.namespace));
@@ -217,7 +214,12 @@ int metrics_unregister_session(const struct nvshare_client *client, const char *
 	struct metrics_message msg;
 	struct pod_gpu_session *session, *tmp;
 	
-	if (!client || metrics_socket < 0) {
+	if (!client || socket_fd < 0) {
+		return -1;
+	}
+
+	if (device_id == 0x00) {
+		log_warn("METRICS ERROR: Cannot register session - device id is empty string");
 		return -1;
 	}
 	
@@ -259,7 +261,12 @@ int metrics_unregister_session(const struct nvshare_client *client, const char *
 int metrics_update_session(const struct nvshare_client *client, const char *device_id) {
 	struct pod_gpu_session *session;
 	
-	if (!client || metrics_socket < 0) {
+	if (!client || socket_fd < 0) {
+		return -1;
+	}
+
+	if (device_id == 0x00) {
+		log_warn("METRICS ERROR: Cannot register session - device id is empty string");
 		return -1;
 	}
 	
@@ -289,9 +296,9 @@ void metrics_cleanup(void) {
 	
 	pthread_mutex_unlock(&metrics_mutex);
 	
-	if (metrics_socket >= 0) {
-		close(metrics_socket);
-		metrics_socket = -1;
+	if (socket_fd >= 0) {
+		close(socket_fd);
+		socket_fd = -1;
 	}
 	
 	log_info("Metrics system cleaned up");
