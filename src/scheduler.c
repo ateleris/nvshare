@@ -93,8 +93,9 @@ static void delete_client(struct nvshare_client *client)
 	client_id_as_string(id_str, sizeof(id_str), client->id);
 	log_info("Removing client %s", id_str);
 	remove_req(client);
-	
-	metrics_unregister_session(client, "nvidia0");
+
+	/* If this client was holding the lock, close out the lock-hold period. */
+	metrics_lock_released(client, "nvidia0");
 
 	/* Remove from clients list */
 	LL_FOREACH_SAFE(clients, c, tmp) {
@@ -302,8 +303,8 @@ try_again:
 		lock_held = 1;
 		must_reset_timer = 1;
 		pthread_cond_broadcast(&timer_cv);
-		
-		metrics_register_session(requests->client, "nvidia0", -1);
+
+		metrics_lock_acquired(requests->client, "nvidia0");
 	}
 }
 
@@ -477,6 +478,7 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			 * are meaningless. Mostly a sanity check.
 			 */
 			if (scheduler_on) {
+				metrics_lock_released(client, "nvidia0");
 				remove_req(client);
 				if (!lock_held) try_schedule();
 			}
