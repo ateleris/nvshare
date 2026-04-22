@@ -11,6 +11,12 @@
 /*
  * Wire protocol version. Bump when any on-wire struct/enum changes. The Go
  * side of the metrics socket rejects messages with a different version.
+ *
+ * Rolling-upgrade order: deploy the device plugin (Go) BEFORE the scheduler
+ * (C). A stale Go plugin receiving a new-format datagram drops it as short
+ * (different size), so metrics are temporarily lost but never corrupted.
+ * The reverse order (new scheduler + stale plugin) also fails safely: the
+ * plugin reads the version uint32 as its old `type` field and rejects it.
  */
 #define METRICS_PROTOCOL_VERSION 1u
 

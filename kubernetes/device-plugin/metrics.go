@@ -237,9 +237,12 @@ func (mc *MetricsCollector) handleRelease(clientID uint64, namespace, pod, devic
 	mc.mutex.Unlock()
 
 	// Prefer the duration computed by the scheduler (authoritative; survives
-	// device-plugin restarts mid-hold). Fall back to local elapsed time.
+	// device-plugin restarts mid-hold). Only fall back to local elapsed time
+	// when the scheduler explicitly signals "no duration available" with a
+	// negative value -- duration_ms == 0 is a legitimate sub-millisecond hold
+	// and must not be overridden.
 	seconds := float64(durationMS) / 1000.0
-	if seconds <= 0 && had {
+	if durationMS < 0 && had {
 		seconds = time.Since(hold.StartTime).Seconds()
 	}
 	if seconds <= 0 {

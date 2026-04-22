@@ -3,13 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
 	"testing"
 )
 
 // buildWireMessage constructs a byte buffer that matches the on-wire
-// layout emitted by src/metrics.c (packed, little-endian). This is the
-// regression test for the wire-format mismatch: if Go's parser or the C
-// struct layout ever drift, this test fails.
+// layout emitted by src/metrics.c (packed, little-endian).
 func buildWireMessage(version, msgType uint32, namespace, pod, device string, clientID uint64, durationMS int64) []byte {
 	buf := make([]byte, metricsMsgSize)
 	off := 0
@@ -73,28 +72,47 @@ func TestParseMetricsMessage_RejectsVersionMismatch(t *testing.T) {
 	}
 }
 
-// TestParseMetricsMessage_AgainstCPayload parses a byte-for-byte copy of
-// a payload produced by the C scheduler's metrics_message struct, ensuring
-// the explicit little-endian layout on both sides stays in lockstep. The
-// blob below was produced by compiling src/metrics.h + common.o and
-// writing a struct with the same values used by TestParseMetricsMessage_Release.
-func TestParseMetricsMessage_AgainstCPayload(t *testing.T) {
-	expected := buildWireMessage(protocolVersion, msgLockReleased, "default", "pod-abc", "nvidia0", 0x1122334455667788, 12345)
-	// If this assertion fails, regenerate the golden buffer from C and
-	// investigate any layout drift before updating the comparand.
-	if len(expected) != 564 {
-		t.Fatalf("unexpected wire size: %d (want 564)", len(expected))
-	}
-	msg, err := parseMetricsMessage(expected)
+// TestParseMetricsMessage_AgainstCGolden loads testdata/wire_golden.bin --
+// a byte-for-byte dump of one metrics_message produced by compiling
+// src/metrics.h and writing the struct to stdout (see the generator in
+// testdata/gen_wire_golden.c). This is the real cross-language regression
+// check: if C changes POD_NAMESPACE_LEN_MAX, field order, or endianness,
+// either the golden no longer parses or buildWireMessage no longer matches
+// it -- and the test fails until Go and C are brought back in sync.
+func TestParseMetricsMessage_AgainstCGolden(t *testing.T) {
+	golden, err := os.ReadFile("testdata/wire_golden.bin")
 	if err != nil {
-		t.Fatalf("parse failed: %v", err)
+		t.Fatalf("read golden: %v", err)
 	}
-	if msg.PodName != "pod-abc" || msg.DurationMS != 12345 {
-		t.Fatalf("parse returned unexpected fields: %+v", msg)
+	if len(golden) != metricsMsgSize {
+		t.Fatalf("golden size: got %d, want %d -- regenerate testdata/wire_golden.bin", len(golden), metricsMsgSize)
 	}
-	// Sanity: the message is all-zero after the payload's nominal
-	// packing boundary (i.e., no accidental padding at the tail).
-	if !bytes.Equal(expected[:2], []byte{0x01, 0x00}) {
-		t.Errorf("version bytes: got %x, want 01 00", expected[:2])
+
+	msg, err := parseMetricsMessage(golden)
+	if err != nil {
+		t.Fatalf("parse golden: %v", err)
+	}
+	if msg.Version != protocolVersion || msg.Type != msgLockReleased {
+		t.Errorf("golden header: got version=%d type=%d, want version=%d type=%d",
+			msg.Version, msg.Type, protocolVersion, msgLockReleased)
+	}
+	if msg.Namespace != "default" || msg.PodName != "pod-abc" || msg.DeviceID != "nvidia0" {
+		t.Errorf("golden strings: got ns=%q pod=%q device=%q",
+			msg.Namespace, msg.PodName, msg.DeviceID)
+	}
+	if msg.ClientID != 0x1122334455667788 {
+		t.Errorf("golden client_id: got %x", msg.ClientID)
+	}
+	if msg.DurationMS != 12345 {
+		t.Errorf("golden duration_ms: got %d", msg.DurationMS)
+	}
+
+	// Byte-for-byte: Go's buildWireMessage with the same inputs must
+	// produce an identical layout. This catches field-order or alignment
+	// drift that parseMetricsMessage alone might tolerate (e.g., if a new
+	// field were added symmetrically on both read paths but not on write).
+	ours := buildWireMessage(protocolVersion, msgLockReleased, "default", "pod-abc", "nvidia0", 0x1122334455667788, 12345)
+	if !bytes.Equal(ours, golden) {
+		t.Fatalf("buildWireMessage output differs from C golden; wire format has drifted")
 	}
 }

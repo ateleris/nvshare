@@ -75,7 +75,7 @@ static int send_metrics_message(const struct metrics_message *msg) {
 		return -1;
 	}
 
-	sent = send(socket_fd, msg, sizeof(*msg), MSG_DONTWAIT);
+	sent = send(socket_fd, msg, sizeof(*msg), MSG_DONTWAIT | MSG_NOSIGNAL);
 	if (sent < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			/* Transient, don't tear down a working connection. */
@@ -88,7 +88,7 @@ static int send_metrics_message(const struct metrics_message *msg) {
 		close_socket();
 		if (try_connect_socket() < 0) return -1;
 
-		sent = send(socket_fd, msg, sizeof(*msg), MSG_DONTWAIT);
+		sent = send(socket_fd, msg, sizeof(*msg), MSG_DONTWAIT | MSG_NOSIGNAL);
 		if (sent < 0) {
 			log_warn("METRICS: send retry failed: %s", strerror(errno));
 			close_socket();
@@ -176,9 +176,9 @@ int metrics_lock_acquired(const struct nvshare_client *client, const char *devic
 }
 
 /*
- * Emit a LOCK_RELEASED for the given session and free it.
- * Caller must have removed the session from active_sessions or must remove
- * it after (this function does neither).
+ * Emit a LOCK_RELEASED for the given session. Caller must LL_DELETE the
+ * session from active_sessions before calling; this function does not
+ * touch the list and does not free the session.
  */
 static void emit_release_for_session(struct pod_gpu_session *session,
 				      const struct timespec *now) {
