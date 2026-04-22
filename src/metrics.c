@@ -7,7 +7,6 @@
 #include <sys/un.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdint.h>
 
 #include "metrics.h"
@@ -15,9 +14,12 @@
 #include "utlist.h"
 #include "comm.h"
 
+/*
+ * All state here is protected by the scheduler's global_mutex (every caller
+ * into this module -- scheduler.c -- holds it). No local mutex is required.
+ */
 static int socket_fd = -1;
 static struct pod_gpu_session *active_sessions = NULL;
-static pthread_mutex_t metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int try_connect_socket(void) {
 	int fd;
@@ -70,14 +72,13 @@ static int send_metrics_message(const struct metrics_message *msg) {
 	ssize_t sent;
 
 	if (socket_fd < 0 && try_connect_socket() < 0) {
-		log_debug("METRICS: send dropped, no connection");
 		return -1;
 	}
 
 	sent = send(socket_fd, msg, sizeof(*msg), MSG_DONTWAIT);
 	if (sent < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			log_debug("METRICS: socket busy, message dropped");
+			/* Transient, don't tear down a working connection. */
 			return -1;
 		}
 
@@ -100,7 +101,6 @@ static int send_metrics_message(const struct metrics_message *msg) {
 		return -1;
 	}
 
-	log_debug("METRICS: sent type=%d for %s/%s", msg->type, msg->namespace, msg->pod_name);
 	return 0;
 }
 
@@ -113,111 +113,125 @@ static struct pod_gpu_session *find_session(uint64_t client_id, const char *devi
 	return NULL;
 }
 
+static int64_t elapsed_ms(const struct timespec *start, const struct timespec *now) {
+	int64_t ms = (int64_t)(now->tv_sec - start->tv_sec) * 1000;
+	ms += ((int64_t)now->tv_nsec - (int64_t)start->tv_nsec) / 1000000;
+	if (ms < 0) ms = 0;
+	return ms;
+}
+
+static void fill_message(struct metrics_message *msg,
+			 uint32_t type,
+			 const char *ns, const char *pod,
+			 const char *device_id,
+			 uint64_t client_id,
+			 int64_t duration_ms) {
+	memset(msg, 0, sizeof(*msg));
+	msg->version = METRICS_PROTOCOL_VERSION;
+	msg->type = type;
+	strlcpy(msg->namespace, ns, sizeof(msg->namespace));
+	strlcpy(msg->pod_name, pod, sizeof(msg->pod_name));
+	strlcpy(msg->device_id, device_id, sizeof(msg->device_id));
+	msg->client_id = client_id;
+	msg->duration_ms = duration_ms;
+}
+
 int metrics_lock_acquired(const struct nvshare_client *client, const char *device_id) {
 	struct pod_gpu_session *session;
 	struct metrics_message msg;
-	time_t now = time(NULL);
+	struct timespec now;
 
 	if (!client || !device_id || device_id[0] == '\0') return -1;
-
-	pthread_mutex_lock(&metrics_mutex);
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
 
 	session = find_session(client->id, device_id);
 	if (session != NULL) {
-		/* Already holding lock for this device.  This can happen if the
-		 * scheduler is restarted without the device plugin seeing the
-		 * corresponding release; just refresh the start time. */
+		/* Already holding lock for this device. Refresh start time;
+		 * the previous hold's duration is lost, but the alternative
+		 * (double-counting) is worse. */
 		session->start_time = now;
-		session->last_active = now;
-		pthread_mutex_unlock(&metrics_mutex);
 		log_debug("METRICS: refresh acquire for client %lx", client->id);
 		return 0;
 	}
 
 	session = malloc(sizeof(*session));
 	if (!session) {
-		pthread_mutex_unlock(&metrics_mutex);
 		log_warn("METRICS: failed to allocate session");
 		return -1;
 	}
 
 	strlcpy(session->namespace, client->pod_namespace, sizeof(session->namespace));
 	strlcpy(session->pod_name, client->pod_name, sizeof(session->pod_name));
-	strlcpy(session->container, "container", sizeof(session->container));
 	strlcpy(session->device_id, device_id, sizeof(session->device_id));
-	session->process_id = 0;
 	session->client_id = client->id;
 	session->start_time = now;
-	session->last_active = now;
 	LL_APPEND(active_sessions, session);
 
-	pthread_mutex_unlock(&metrics_mutex);
-
-	memset(&msg, 0, sizeof(msg));
-	msg.type = (int32_t)METRICS_LOCK_ACQUIRED;
-	strlcpy(msg.namespace, client->pod_namespace, sizeof(msg.namespace));
-	strlcpy(msg.pod_name, client->pod_name, sizeof(msg.pod_name));
-	strlcpy(msg.container, "container", sizeof(msg.container));
-	strlcpy(msg.device_id, device_id, sizeof(msg.device_id));
-	msg.process_id = 0;
-	msg.client_id = client->id;
-	msg.timestamp = (int64_t)now;
-
+	fill_message(&msg, METRICS_LOCK_ACQUIRED,
+		     client->pod_namespace, client->pod_name,
+		     device_id, client->id, 0);
 	send_metrics_message(&msg);
 	log_info("METRICS: lock acquired by %s/%s", client->pod_namespace, client->pod_name);
 	return 0;
 }
 
+/*
+ * Emit a LOCK_RELEASED for the given session and free it.
+ * Caller must have removed the session from active_sessions or must remove
+ * it after (this function does neither).
+ */
+static void emit_release_for_session(struct pod_gpu_session *session,
+				      const struct timespec *now) {
+	struct metrics_message msg;
+	int64_t duration_ms = elapsed_ms(&session->start_time, now);
+
+	fill_message(&msg, METRICS_LOCK_RELEASED,
+		     session->namespace, session->pod_name,
+		     session->device_id, session->client_id, duration_ms);
+	send_metrics_message(&msg);
+	log_info("METRICS: lock released by %s/%s after %lld ms",
+		 session->namespace, session->pod_name, (long long)duration_ms);
+}
+
 int metrics_lock_released(const struct nvshare_client *client, const char *device_id) {
 	struct pod_gpu_session *session;
-	struct metrics_message msg;
-	time_t now = time(NULL);
-	int64_t duration_sec;
+	struct timespec now;
 
 	if (!client || !device_id || device_id[0] == '\0') return -1;
-
-	pthread_mutex_lock(&metrics_mutex);
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
 
 	session = find_session(client->id, device_id);
 	if (!session) {
-		pthread_mutex_unlock(&metrics_mutex);
 		log_debug("METRICS: release without active session for client %lx", client->id);
 		return 0;
 	}
 
-	duration_sec = (int64_t)now - (int64_t)session->start_time;
-	if (duration_sec < 0) duration_sec = 0;
-
-	memset(&msg, 0, sizeof(msg));
-	msg.type = (int32_t)METRICS_LOCK_RELEASED;
-	strlcpy(msg.namespace, session->namespace, sizeof(msg.namespace));
-	strlcpy(msg.pod_name, session->pod_name, sizeof(msg.pod_name));
-	strlcpy(msg.container, session->container, sizeof(msg.container));
-	strlcpy(msg.device_id, session->device_id, sizeof(msg.device_id));
-	msg.process_id = session->process_id;
-	msg.client_id = session->client_id;
-	msg.timestamp = duration_sec;
-
 	LL_DELETE(active_sessions, session);
+	emit_release_for_session(session, &now);
 	free(session);
-	pthread_mutex_unlock(&metrics_mutex);
-
-	send_metrics_message(&msg);
-	log_info("METRICS: lock released by %s/%s after %lld s",
-		  msg.namespace, msg.pod_name, (long long)duration_sec);
 	return 0;
 }
 
-void metrics_cleanup(void) {
+/*
+ * Emit LOCK_RELEASED for every currently-active session and drop them.
+ * Used when the scheduler transitions to SCHED_OFF (lock holder is about
+ * to be invalidated) and on graceful shutdown (SIGTERM).
+ */
+void metrics_flush_all(void) {
 	struct pod_gpu_session *session, *tmp;
+	struct timespec now;
 
-	pthread_mutex_lock(&metrics_mutex);
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+
 	LL_FOREACH_SAFE(active_sessions, session, tmp) {
 		LL_DELETE(active_sessions, session);
+		emit_release_for_session(session, &now);
 		free(session);
 	}
-	pthread_mutex_unlock(&metrics_mutex);
+}
 
+void metrics_cleanup(void) {
+	metrics_flush_all();
 	close_socket();
 	log_info("Metrics system cleaned up");
 }

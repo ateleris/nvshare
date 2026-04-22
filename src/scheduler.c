@@ -22,6 +22,8 @@
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/epoll.h>
+#include <sys/signalfd.h>
+#include <signal.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +54,9 @@ pthread_mutex_t global_mutex;
 
 /* File descriptor for epoll */
 int epoll_fd;
+
+/* signalfd for graceful shutdown (SIGTERM/SIGINT) */
+int sig_fd;
 
 
 struct nvshare_client *clients = NULL;
@@ -429,7 +434,12 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			 * When the scheduler is OFF, every client thinks they
 			 * have the lock, so the requests list instantaneously
 			 * becomes invalid. Empty it.
+			 *
+			 * Before emptying, flush any in-flight metrics hold
+			 * so the current lock holder's time is billed (not
+			 * silently dropped when their request is freed).
 			 */
+			metrics_flush_all();
 			struct nvshare_request *tmp, *r;
 			LL_FOREACH_SAFE(requests, r, tmp) {
 				LL_DELETE(requests, r);
@@ -550,8 +560,24 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 
 	true_or_exit(pthread_mutex_init(&global_mutex, NULL) == 0);
 	true_or_exit(pthread_cond_init(&timer_cv, NULL) == 0);
-	
+
 	metrics_init();
+
+	/*
+	 * Install a signalfd for SIGTERM/SIGINT. The signals are blocked
+	 * process-wide so they are delivered only through signalfd -- this
+	 * lets us handle shutdown from the main epoll loop without racing
+	 * with the timer thread holding global_mutex.
+	 */
+	{
+		sigset_t mask;
+		sigemptyset(&mask);
+		sigaddset(&mask, SIGTERM);
+		sigaddset(&mask, SIGINT);
+		true_or_exit(pthread_sigmask(SIG_BLOCK, &mask, NULL) == 0);
+		sig_fd = signalfd(-1, &mask, SFD_CLOEXEC);
+		true_or_exit(sig_fd >= 0);
+	}
 
 	if (nvshare_get_scheduler_path(nvscheduler_socket_path) != 0)
 		log_fatal("nvshare_get_scheduler_path() failed!");
@@ -561,7 +587,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 
 	/* Set up fd for epoll */
 	true_or_exit((epoll_fd = epoll_create(1)) >= 0);
-	
+
 	/* Start listening */
 	true_or_exit(nvshare_bind_and_listen(&lsock, nvscheduler_socket_path) == 0);
 
@@ -570,6 +596,11 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	event.data.fd = lsock;
 	event.events = EPOLLIN;
 	true_or_exit(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, lsock, &event) == 0);
+
+	/* Register signalfd with epoll for graceful shutdown */
+	event.data.fd = sig_fd;
+	event.events = EPOLLIN;
+	true_or_exit(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sig_fd, &event) == 0);
 
 	/*
 	 * According to man unix(7):
@@ -589,7 +620,9 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	log_info("nvshare-scheduler listening on %s",
 		 nvscheduler_socket_path);
 
-	for (;;) {
+	int shutdown_requested = 0;
+
+	while (!shutdown_requested) {
 		num_fds = RETRY_INTR(epoll_wait(epoll_fd, events, EPOLL_MAX_EVENTS, -1));
 
 		/* Since we use an infinite timeout, a non-zero return value
@@ -602,6 +635,15 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 		true_or_exit(pthread_mutex_lock(&global_mutex) == 0);
 
 		for (int i = 0; i < num_fds; i++) {
+			if (events[i].data.fd == sig_fd) {
+				struct signalfd_siginfo si;
+				ssize_t r = read(sig_fd, &si, sizeof(si));
+				if (r == sizeof(si)) {
+					log_info("Received signal %u, shutting down", si.ssi_signo);
+				}
+				shutdown_requested = 1;
+				continue;
+			}
 			if (events[i].data.fd == lsock) {
 				/* New connection. */
 				ret = nvshare_accept(events[i].data.fd, &rsock);
@@ -663,8 +705,15 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 		true_or_exit(pthread_mutex_unlock(&global_mutex) == 0);
 	}
 
-	/* Control should never reach here */
+	/*
+	 * Graceful shutdown (SIGTERM/SIGINT). Flush in-flight metrics so
+	 * the current lock holder's accrued hold time is billed rather
+	 * than dropped on pod restart / rolling upgrade. Hold global_mutex
+	 * across the flush so the timer thread cannot race with us.
+	 */
+	true_or_exit(pthread_mutex_lock(&global_mutex) == 0);
 	metrics_cleanup();
-	return -1;
+	true_or_exit(pthread_mutex_unlock(&global_mutex) == 0);
+	return 0;
 }
 
