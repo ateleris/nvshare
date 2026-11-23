@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -39,11 +41,16 @@ const (
 	// not been refreshed for this long is no longer exported.
 	staleAfter = 60 * time.Second
 
-	// nvshare manages exactly one GPU per node.
-	gpuDevice = "nvidia0"
+	rejectedVersion   = 0
+	rejectedMalformed = 1
+	rejectReasons     = 2
 )
 
 var releaseReasonNames = [releaseReasons]string{"quantum", "idle", "exit", "off"}
+
+var rejectReasonNames = [rejectReasons]string{"version", "malformed"}
+
+var errProtocolVersion = errors.New("unsupported protocol version")
 
 type podStats struct {
 	Namespace    string
@@ -83,13 +90,15 @@ type MetricsCollector struct {
 	pods        map[podKey]podEntry
 	sched       schedStats
 	schedSeen   time.Time
+	rejected    [rejectReasons]uint64
 	lastWarning time.Time
 
 	metricsPort int
 	node        string
+	gpuUUID     string
 	now         func() time.Time
 
-	// Labels: namespace, pod, gpu_device, node.
+	// Labels: namespace, pod, gpu_uuid, node.
 	//
 	// `pod` is high-cardinality by design -- per-pod billing is the point.
 	lockHeldSeconds *prometheus.Desc
@@ -107,16 +116,20 @@ type MetricsCollector struct {
 	schedQueueLength *prometheus.Desc
 	schedDropped     *prometheus.Desc
 	schedLastUpdate  *prometheus.Desc
+
+	// Labels: node, reason.
+	messagesRejected *prometheus.Desc
 }
 
-func newMetricsCollector(port int, node string, now func() time.Time) *MetricsCollector {
-	podLabels := []string{"namespace", "pod", "gpu_device", "node"}
+func newMetricsCollector(port int, node, gpuUUID string, now func() time.Time) *MetricsCollector {
+	podLabels := []string{"namespace", "pod", "gpu_uuid", "node"}
 	nodeLabels := []string{"node"}
 
 	return &MetricsCollector{
 		pods:        make(map[podKey]podEntry),
 		metricsPort: port,
 		node:        node,
+		gpuUUID:     gpuUUID,
 		now:         now,
 
 		lockHeldSeconds: prometheus.NewDesc(
@@ -172,11 +185,16 @@ func newMetricsCollector(port int, node string, now func() time.Time) *MetricsCo
 			"nvshare_scheduler_last_update_timestamp_seconds",
 			"Unix time of the last message received from the nvshare scheduler.",
 			nodeLabels, nil),
+
+		messagesRejected: prometheus.NewDesc(
+			"nvshare_device_plugin_metrics_rejected_total",
+			"Total number of scheduler messages the device plugin ignored, by reason: version (scheduler and device plugin speak different protocol versions), malformed.",
+			append(nodeLabels, "reason"), nil),
 	}
 }
 
-func NewMetricsCollector(port int) *MetricsCollector {
-	mc := newMetricsCollector(port, nodeName(), time.Now)
+func NewMetricsCollector(port int, gpuUUID string) *MetricsCollector {
+	mc := newMetricsCollector(port, nodeName(), gpuUUID, time.Now)
 	prometheus.MustRegister(mc)
 	return mc
 }
@@ -194,7 +212,7 @@ func (mc *MetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 		mc.lockHeldSeconds, mc.lockWaitSeconds, mc.locksAcquired, mc.lockReleases,
 		mc.lockHolding, mc.lockWaiting, mc.podClients,
 		mc.schedEnabled, mc.schedTimeQuantum, mc.schedClients, mc.schedQueueLength,
-		mc.schedDropped, mc.schedLastUpdate,
+		mc.schedDropped, mc.schedLastUpdate, mc.messagesRejected,
 	} {
 		ch <- desc
 	}
@@ -214,7 +232,7 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 
 		s := entry.stats
-		labels := []string{s.Namespace, s.Pod, gpuDevice, mc.node}
+		labels := []string{s.Namespace, s.Pod, mc.gpuUUID, mc.node}
 		counter := func(desc *prometheus.Desc, v float64, extra ...string) {
 			ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, v, append(labels, extra...)...)
 		}
@@ -231,6 +249,11 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		gauge(mc.lockHolding, float64(s.Holding))
 		gauge(mc.lockWaiting, float64(s.Waiting))
 		gauge(mc.podClients, float64(s.Clients))
+	}
+
+	for i, reason := range rejectReasonNames {
+		ch <- prometheus.MustNewConstMetric(mc.messagesRejected, prometheus.CounterValue,
+			float64(mc.rejected[i]), mc.node, reason)
 	}
 
 	if mc.schedSeen.IsZero() {
@@ -263,15 +286,25 @@ func (mc *MetricsCollector) StartMetricsServer() error {
 		httpListener.Close()
 		return fmt.Errorf("listen on %s: %w", metricsSocketPath, err)
 	}
-	if err := os.Chmod(metricsSocketPath, 0666); err != nil {
+	if err := os.Chmod(metricsSocketPath, 0600); err != nil {
 		log.Printf("WARN: chmod %s: %v", metricsSocketPath, err)
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 	go func() {
 		log.Printf("Starting metrics server on :%d", mc.metricsPort)
-		log.Fatalf("Metrics server failed: %v", http.Serve(httpListener, mux))
+		log.Fatalf("Metrics server failed: %v", server.Serve(httpListener))
 	}()
 
 	log.Printf("Metrics listener ready on %s", metricsSocketPath)
@@ -300,6 +333,11 @@ func (mc *MetricsCollector) handleDatagram(buf []byte) {
 
 	now := mc.now()
 	if err != nil {
+		if errors.Is(err, errProtocolVersion) {
+			mc.rejected[rejectedVersion]++
+		} else {
+			mc.rejected[rejectedMalformed]++
+		}
 		// An old scheduler keeps sending; do not flood the log.
 		if now.Sub(mc.lastWarning) > time.Minute {
 			log.Printf("WARN: ignoring metrics message: %v", err)
@@ -331,7 +369,7 @@ func parseMetricsMessage(buf []byte) (any, error) {
 
 	le := binary.LittleEndian
 	if version := le.Uint32(buf); version != protocolVersion {
-		return nil, fmt.Errorf("unsupported protocol version %d (expected %d)", version, protocolVersion)
+		return nil, fmt.Errorf("%w %d (expected %d)", errProtocolVersion, version, protocolVersion)
 	}
 
 	switch msgType := le.Uint32(buf[4:]); msgType {
@@ -347,6 +385,9 @@ func parseMetricsMessage(buf []byte) (any, error) {
 		off += nameFieldLen
 		if m.Namespace == "" || m.Pod == "" {
 			return nil, fmt.Errorf("pod stats message without namespace or pod")
+		}
+		if !utf8.ValidString(m.Namespace) || !utf8.ValidString(m.Pod) {
+			return nil, fmt.Errorf("pod stats message with a namespace or pod that is not valid UTF-8")
 		}
 		m.Clients = le.Uint32(buf[off:])
 		m.Holding = le.Uint32(buf[off+4:])

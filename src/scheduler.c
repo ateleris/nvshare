@@ -37,6 +37,7 @@
 #include "utlist.h"
 #include "nvshare_types.h"
 #include "metrics.h"
+#include "pod_identity.h"
 
 #define NVSHARE_DEFAULT_TQ 30
 
@@ -168,6 +169,15 @@ static int register_client(struct nvshare_client *client, const struct message *
 		return -1;
 	}
 
+	strlcpy(client->pod_name, in_msg->pod_name,
+		sizeof(client->pod_name));
+	strlcpy(client->pod_namespace, in_msg->pod_namespace,
+		sizeof(client->pod_namespace));
+	if (pod_identity_verify(client->fd, client->pod_namespace,
+				sizeof(client->pod_namespace), client->pod_name,
+				sizeof(client->pod_name)) < 0)
+		return -1;
+
 again:
 	nvshare_client_id = nvshare_generate_id();
 	if (nvshare_client_id == NVSHARE_UNREGISTERED_ID) /* Tough luck */
@@ -178,14 +188,7 @@ again:
 		}
 	}
 
-	/*
-	 * Store the rest of the client information.
-	 */
 	client->id = nvshare_client_id;
-	strlcpy(client->pod_name, in_msg->pod_name,
-		sizeof(client->pod_name));
-	strlcpy(client->pod_namespace, in_msg->pod_namespace,
-		sizeof(client->pod_namespace));
 
 	/*
 	 * Inform the client of the current status of our current status, as
@@ -283,6 +286,9 @@ static int receive_message(struct nvshare_client *client, struct message *msg_p)
 			return -1;
 		} else log_fatal("nvshare_receive_noblock() failed unrecoverably");
 	}
+	msg_p->pod_name[sizeof(msg_p->pod_name) - 1] = '\0';
+	msg_p->pod_namespace[sizeof(msg_p->pod_namespace) - 1] = '\0';
+	msg_p->data[sizeof(msg_p->data) - 1] = '\0';
 	return 0;
 }
 

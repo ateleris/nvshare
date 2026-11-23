@@ -47,4 +47,3 @@ func newOSWatcher(sigs ...os.Signal) chan os.Signal {
 
 	return sigChan
 }
-

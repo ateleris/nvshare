@@ -1,0 +1,15 @@
+FROM ubuntu:22.04 AS build
+COPY ./src/ /src
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libc6-dev \
+    make
+RUN make comm.o common.o
+COPY ./tests/fake-client.c /tests/fake-client.c
+RUN gcc -static -Wall -Wextra -Werror -I/src /tests/fake-client.c comm.o common.o -o /fake-client
+
+
+FROM scratch
+COPY --from=build /fake-client /fake-client
+ENTRYPOINT ["/fake-client"]

@@ -18,24 +18,28 @@
 package main
 
 import (
-	"strconv"
-	"syscall"
 	"log"
 	"os"
+	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
 const (
-	LibNvshareHostPath               = "/var/run/nvshare/libnvshare.so"
-	LibNvshareContainerPath          = "/usr/lib/nvshare/libnvshare.so"
-	SocketHostPath                   = "/var/run/nvshare/scheduler.sock"
-	SocketContainerPath              = "/var/run/nvshare/scheduler.sock"
-	NvshareVirtualDevicesEnvVar      = "NVSHARE_VIRTUAL_DEVICES"
-	NvidiaDevicesEnvVar              = "NVIDIA_VISIBLE_DEVICES"
-	NvidiaExposeMountDir             = "/var/run/nvidia-container-devices"
-	NvidiaExposeMountHostPath        = "/dev/null"
+	LibNvshareHostPath          = "/var/run/nvshare/libnvshare.so"
+	LibNvshareContainerPath     = "/usr/lib/nvshare/libnvshare.so"
+	SocketHostPath              = "/var/run/nvshare/scheduler.sock"
+	SocketContainerPath         = "/var/run/nvshare/scheduler.sock"
+	NvshareVirtualDevicesEnvVar = "NVSHARE_VIRTUAL_DEVICES"
+	NvidiaDevicesEnvVar         = "NVIDIA_VISIBLE_DEVICES"
+	NvidiaExposeMountDir        = "/var/run/nvidia-container-devices"
+	NvidiaExposeMountHostPath   = "/dev/null"
+	MetricsPortEnvVar           = "NVSHARE_METRICS_PORT"
+	DefaultMetricsPort          = 8080
+	StartRetryInterval          = 5 * time.Second
 )
 
 var UUID string
@@ -48,7 +52,7 @@ func main() {
 	var NumVirtualDevicesEnv string
 	var err error
 	var devicePlugin *NvshareDevicePlugin
-
+	var retry <-chan time.Time
 
 	log.SetOutput(os.Stderr)
 
@@ -69,7 +73,7 @@ func main() {
 	 */
 	nvidiaRuntimeUseMounts = false
 	UUID, exists = os.LookupEnv(NvidiaDevicesEnvVar)
-	if exists == false {
+	if !exists {
 		log.Printf("%s is not set, exiting", NvidiaDevicesEnvVar)
 		os.Exit(1)
 	}
@@ -78,7 +82,7 @@ func main() {
 	 * Find out how many virtual GPUs we must advertize
 	 */
 	NumVirtualDevicesEnv, exists = os.LookupEnv(NvshareVirtualDevicesEnvVar)
-	if exists == false {
+	if !exists {
 		log.Printf("%s is not set, exiting", NvshareVirtualDevicesEnvVar)
 		os.Exit(1)
 	}
@@ -120,7 +124,15 @@ func main() {
 
 	log.Printf("Read UUID = %s", UUID)
 
-	metricsCollector = NewMetricsCollector(8080)
+	metricsPort := DefaultMetricsPort
+	if value, exists := os.LookupEnv(MetricsPortEnvVar); exists {
+		metricsPort, err = strconv.Atoi(value)
+		if err != nil || metricsPort < 1 || metricsPort > 65535 {
+			log.Fatalf("%s is not a valid port: %q", MetricsPortEnvVar, value)
+		}
+	}
+
+	metricsCollector = NewMetricsCollector(metricsPort, UUID)
 	if err := metricsCollector.StartMetricsServer(); err != nil {
 		log.Fatalf("Failed to start metrics server: %v", err)
 	}
@@ -141,23 +153,21 @@ restart:
 
 	devicePlugin = NewNvshareDevicePlugin()
 
-	pluginStartError := make(chan struct{})
-
 	/*
 	 * Start the gRPC server for the device plugin and connect it with
 	 * the kubelet.
 	 */
+	retry = nil
 	err = devicePlugin.Start()
 	if err != nil {
-		log.Println("devicePlugin.Start() FAILED. Could not contact Kubelet, retrying. Did you enable the device plugin feature gate?")
-		close(pluginStartError)
-		goto events
+		log.Printf("devicePlugin.Start() FAILED. Could not contact Kubelet, retrying in %s. Did you enable the device plugin feature gate?", StartRetryInterval)
+		retry = time.After(StartRetryInterval)
 	}
 
 events:
 	for {
 		select {
-		case <-pluginStartError:
+		case <-retry:
 			goto restart
 
 		case event := <-watcher.Events:
@@ -181,6 +191,4 @@ events:
 			}
 		}
 	}
-	return
 }
-

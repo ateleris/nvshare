@@ -123,15 +123,17 @@ func TestParseMetricsMessage_Rejects(t *testing.T) {
 	binary.LittleEndian.PutUint32(unknownType[4:], 999)
 
 	cases := map[string][]byte{
-		"empty":             {},
-		"shorter than head": make([]byte, 7),
-		"old version":       buildPodStats(protocolVersion-1, goldenPodStats),
-		"newer version":     buildSchedStats(protocolVersion+1, goldenSchedStats),
-		"truncated pod":     buildPodStats(protocolVersion, goldenPodStats)[:podStatsSize-1],
-		"oversized sched":   append(buildSchedStats(protocolVersion, goldenSchedStats), 0),
-		"unknown type":      unknownType,
-		"no namespace":      buildPodStats(protocolVersion, podStats{Pod: "p"}),
-		"no pod":            buildPodStats(protocolVersion, podStats{Namespace: "ns"}),
+		"empty":              {},
+		"shorter than head":  make([]byte, 7),
+		"old version":        buildPodStats(protocolVersion-1, goldenPodStats),
+		"newer version":      buildSchedStats(protocolVersion+1, goldenSchedStats),
+		"truncated pod":      buildPodStats(protocolVersion, goldenPodStats)[:podStatsSize-1],
+		"oversized sched":    append(buildSchedStats(protocolVersion, goldenSchedStats), 0),
+		"unknown type":       unknownType,
+		"no namespace":       buildPodStats(protocolVersion, podStats{Pod: "p"}),
+		"no pod":             buildPodStats(protocolVersion, podStats{Namespace: "ns"}),
+		"namespace not utf8": buildPodStats(protocolVersion, podStats{Namespace: "ns\xff", Pod: "p"}),
+		"pod not utf8":       buildPodStats(protocolVersion, podStats{Namespace: "ns", Pod: "p\xff\xfe"}),
 	}
 	for name, buf := range cases {
 		if _, err := parseMetricsMessage(buf); err == nil {
@@ -150,7 +152,7 @@ func (c *fakeClock) now() time.Time {
 
 func newTestCollector() (*MetricsCollector, *prometheus.Registry, *fakeClock) {
 	clock := &fakeClock{t: time.Unix(1700000000, 0)}
-	mc := newMetricsCollector(0, "node-1", clock.now)
+	mc := newMetricsCollector(0, "node-1", "GPU-test", clock.now)
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(mc)
 	return mc, reg, clock
@@ -179,30 +181,34 @@ func TestCollector_ExportsSchedulerState(t *testing.T) {
 	}))
 
 	want := `
+# HELP nvshare_device_plugin_metrics_rejected_total Total number of scheduler messages the device plugin ignored, by reason: version (scheduler and device plugin speak different protocol versions), malformed.
+# TYPE nvshare_device_plugin_metrics_rejected_total counter
+nvshare_device_plugin_metrics_rejected_total{node="node-1",reason="malformed"} 0
+nvshare_device_plugin_metrics_rejected_total{node="node-1",reason="version"} 0
 # HELP nvshare_pod_gpu_clients Number of the pod's processes connected to the nvshare scheduler.
 # TYPE nvshare_pod_gpu_clients gauge
-nvshare_pod_gpu_clients{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1"} 2
+nvshare_pod_gpu_clients{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 2
 # HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the exclusive nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_held_seconds_total counter
-nvshare_pod_gpu_lock_held_seconds_total{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1"} 90.5
+nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 90.5
 # HELP nvshare_pod_gpu_lock_holding 1 if the pod currently holds the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_holding gauge
-nvshare_pod_gpu_lock_holding{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1"} 1
+nvshare_pod_gpu_lock_holding{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 1
 # HELP nvshare_pod_gpu_lock_releases_total Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired), idle (released on its own), exit (process went away), off (scheduler turned off or stopped).
 # TYPE nvshare_pod_gpu_lock_releases_total counter
-nvshare_pod_gpu_lock_releases_total{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1",reason="exit"} 0
-nvshare_pod_gpu_lock_releases_total{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1",reason="idle"} 1
-nvshare_pod_gpu_lock_releases_total{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1",reason="off"} 0
-nvshare_pod_gpu_lock_releases_total{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1",reason="quantum"} 3
+nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="exit"} 0
+nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="idle"} 1
+nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="off"} 0
+nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="quantum"} 3
 # HELP nvshare_pod_gpu_lock_wait_seconds_total Total seconds each pod has spent queued for the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_wait_seconds_total counter
-nvshare_pod_gpu_lock_wait_seconds_total{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1"} 30.25
+nvshare_pod_gpu_lock_wait_seconds_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 30.25
 # HELP nvshare_pod_gpu_lock_waiting Number of the pod's processes currently queued for the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_waiting gauge
-nvshare_pod_gpu_lock_waiting{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1"} 1
+nvshare_pod_gpu_lock_waiting{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 1
 # HELP nvshare_pod_gpu_locks_acquired_total Total number of times each pod has acquired the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_locks_acquired_total counter
-nvshare_pod_gpu_locks_acquired_total{gpu_device="nvidia0",namespace="team-a",node="node-1",pod="train-1"} 4
+nvshare_pod_gpu_locks_acquired_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 4
 # HELP nvshare_scheduler_clients Number of processes connected to the nvshare scheduler.
 # TYPE nvshare_scheduler_clients gauge
 nvshare_scheduler_clients{node="node-1"} 3
@@ -238,10 +244,10 @@ func TestCollector_LaterMessageReplacesEarlier(t *testing.T) {
 	want := `
 # HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the exclusive nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_held_seconds_total counter
-nvshare_pod_gpu_lock_held_seconds_total{gpu_device="nvidia0",namespace="ns",node="node-1",pod="p"} 25
+nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="ns",node="node-1",pod="p"} 25
 # HELP nvshare_pod_gpu_locks_acquired_total Total number of times each pod has acquired the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_locks_acquired_total counter
-nvshare_pod_gpu_locks_acquired_total{gpu_device="nvidia0",namespace="ns",node="node-1",pod="p"} 2
+nvshare_pod_gpu_locks_acquired_total{gpu_uuid="GPU-test",namespace="ns",node="node-1",pod="p"} 2
 `
 	err := testutil.GatherAndCompare(reg, strings.NewReader(want),
 		"nvshare_pod_gpu_lock_held_seconds_total", "nvshare_pod_gpu_locks_acquired_total")
@@ -250,16 +256,29 @@ nvshare_pod_gpu_locks_acquired_total{gpu_device="nvidia0",namespace="ns",node="n
 	}
 }
 
-func TestCollector_IgnoresInvalidMessages(t *testing.T) {
+func TestCollector_CountsInvalidMessages(t *testing.T) {
 	mc, reg, _ := newTestCollector()
 
 	mc.handleDatagram(buildPodStats(protocolVersion-1, podStats{Namespace: "ns", Pod: "p", HeldMS: 10000}))
+	mc.handleDatagram(buildSchedStats(protocolVersion+1, goldenSchedStats))
 	mc.handleDatagram([]byte("garbage"))
+	mc.handleDatagram(buildPodStats(protocolVersion, podStats{Namespace: "ns", Pod: "bad\xff", HeldMS: 10000}))
+	mc.handleDatagram(buildPodStats(protocolVersion, podStats{Namespace: "ns", Pod: "good", HeldMS: 10000}))
 
-	if n := testutil.CollectAndCount(mc); n != 0 {
-		t.Errorf("exported %d metrics after only invalid messages, want 0", n)
-	}
-	if err := testutil.GatherAndCompare(reg, strings.NewReader("")); err != nil {
+	want := `
+# HELP nvshare_device_plugin_metrics_rejected_total Total number of scheduler messages the device plugin ignored, by reason: version (scheduler and device plugin speak different protocol versions), malformed.
+# TYPE nvshare_device_plugin_metrics_rejected_total counter
+nvshare_device_plugin_metrics_rejected_total{node="node-1",reason="malformed"} 2
+nvshare_device_plugin_metrics_rejected_total{node="node-1",reason="version"} 2
+# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the exclusive nvshare GPU lock.
+# TYPE nvshare_pod_gpu_lock_held_seconds_total counter
+nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="ns",node="node-1",pod="good"} 10
+`
+	err := testutil.GatherAndCompare(reg, strings.NewReader(want),
+		"nvshare_device_plugin_metrics_rejected_total",
+		"nvshare_pod_gpu_lock_held_seconds_total",
+		"nvshare_scheduler_enabled")
+	if err != nil {
 		t.Error(err)
 	}
 }
@@ -280,7 +299,7 @@ func TestCollector_DropsStaleState(t *testing.T) {
 	want := `
 # HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the exclusive nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_held_seconds_total counter
-nvshare_pod_gpu_lock_held_seconds_total{gpu_device="nvidia0",namespace="ns",node="node-1",pod="fresh"} 2
+nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="ns",node="node-1",pod="fresh"} 2
 # HELP nvshare_scheduler_last_update_timestamp_seconds Unix time of the last message received from the nvshare scheduler.
 # TYPE nvshare_scheduler_last_update_timestamp_seconds gauge
 nvshare_scheduler_last_update_timestamp_seconds{node="node-1"} 1.7e+09

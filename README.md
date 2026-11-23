@@ -36,6 +36,7 @@ I've written a [Medium article](https://grgalex.medium.com/gpu-virtualization-in
   - [Usage (Kubernetes)](#usage_k8s)
     - [Use an `nvshare.com/gpu` Device](#usage_k8s_device)
     - [(Optional) Configure scheduler using `nvsharectl`](#usage_k8s_conf)
+  - [Metrics (Kubernetes)](#metrics_k8s)
   - [Test (Kubernetes)](#test_k8s)
   - [Uninstall (Kubernetes)](#uninstall_k8s)
 - [Build For Local Use](#build_local)
@@ -56,6 +57,7 @@ I've written a [Medium article](https://grgalex.medium.com/gpu-virtualization-in
    - Scheduler optionally serializes overlapping GPU work to avoid thrashing (assigns exclusive access to one app for TQ seconds at a time)
    - Apps release GPU if done with work before TQ elapses
 - Device plugin for Kubernetes
+- Prometheus metrics for the GPU time of every pod
 
 <a name="key_ideas"/>
 
@@ -141,13 +143,10 @@ To minimize the overall completion time of a set of sequential (batch) jobs, you
 `nvshare` is based on my diploma thesis titled "Dynamic memory management for the efficient utilization of graphics processing units in interactive machine learning development", published in July 2021 and available at http://dx.doi.org/10.26240/heal.ntua.21988.
 
 #### Thesis:
-The title and first part are in Greek, but the second part is the full thesis in English. You can also find it at [`grgalex-thesis.pdf`](grgalex-thesis.pdf) in the root of this repo.
+The title and first part are in Greek, but the second part is the full thesis in English.
 
 #### Presentation:
-View the presentation on `nvshare`:
-- [Google Slides](https://docs.google.com/presentation/d/16aIY0WLZutHHMZ9LJ0kCc78A5Inm5rh0P1FqNYzzCeg)
-- [In `ODP` format](grgalex-nvshare-presentation.odp)
-- [In `PDF` format](grgalex-nvshare-presentation.pdf)
+View the presentation on `nvshare` on [Google Slides](https://docs.google.com/presentation/d/16aIY0WLZutHHMZ9LJ0kCc78A5Inm5rh0P1FqNYzzCeg).
 
 <a name="deploy_local"/>
 
@@ -368,13 +367,19 @@ Deploy the `nvshare` Kubernetes components:
 2. `nvshare-system` ResourceQuotas
 3. `nvshare-device-plugin` DaemonSet
 4. `nvshare-scheduler` DaemonSet
+5. `nvshare-metrics` Service
 
       ```bash
-      kubectl apply -f https://raw.githubusercontent.com/grgalex/nvshare/main/kubernetes/manifests/nvshare-system.yaml && \
-      kubectl apply -f https://raw.githubusercontent.com/grgalex/nvshare/main/kubernetes/manifests/nvshare-system-quotas.yaml && \
-      kubectl apply -f https://raw.githubusercontent.com/grgalex/nvshare/main/kubernetes/manifests/device-plugin.yaml && \
-      kubectl apply -f https://raw.githubusercontent.com/grgalex/nvshare/main/kubernetes/manifests/scheduler.yaml
+      kubectl apply -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/nvshare-system.yaml && \
+      kubectl apply -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/nvshare-system-quotas.yaml && \
+      kubectl apply -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/device-plugin.yaml && \
+      kubectl apply -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/scheduler.yaml && \
+      kubectl apply -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/metrics-service.yaml
       ```
+
+The manifests pin the scheduler, device plugin and `libnvshare` images to the same release. Keep them on the same release when you upgrade.
+
+The scheduler runs in the host PID namespace (`hostPID: true`) and mounts `/var/log/pods` read-only. It uses both to find the pod a client process really runs in, see [Metrics](#metrics_k8s).
 
 The Device Plugin runs on every GPU-enabled node in your Kubernetes cluster (currently it will fail on non-GPU nodes but that is OK) and manages a single GPU on every node. It consumes a single `nvidia.com/gpu` device and advertizes it as multiple (by default 10) `nvshare.com/gpu` devices. This means that up to 10 containers can concurrently run on the same physical GPU.
 
@@ -418,6 +423,18 @@ resources:
       kubectl exec -ti ${NVSHARE_SCHEDULER_POD_NAME?} -n nvshare-system -- nvsharectl ...
       ```
 
+<a name="metrics_k8s"/>
+
+### Metrics (Kubernetes)
+
+The device plugin serves Prometheus metrics on port 8080 (`/metrics`) of every GPU node: how long each pod held the GPU, how long it waited for it, and the state of the scheduler. Change the port with the `NVSHARE_METRICS_PORT` environment variable of the device plugin.
+
+The pod names in the metrics do not come from the pods themselves: the scheduler looks up the pod of every client process, so a pod cannot report GPU time under another pod's name.
+
+If you use the Prometheus Operator, apply `kubernetes/manifests/metrics-servicemonitor.yaml` to scrape the metrics.
+
+See [METRICS_IMPLEMENTATION.md](METRICS_IMPLEMENTATION.md) for the list of metrics, example queries and what to watch when upgrading.
+
 <a name="test_k8s"/>
 
 ### Test (Kubernetes)
@@ -459,10 +476,11 @@ resources:
 Delete all `nvshare` components from your cluster:
 
 ```bash
-kubectl delete -f https://raw.githubusercontent.com/grgalex/nvshare/main/kubernetes/manifests/scheduler.yaml
-kubectl delete -f https://raw.githubusercontent.com/grgalex/nvshare/main/kubernetes/manifests/device-plugin.yaml && \
-kubectl delete -f https://raw.githubusercontent.com/grgalex/nvshare/main/kubernetes/manifests/nvshare-system-quotas.yaml && \
-kubectl delete -f https://raw.githubusercontent.com/grgalex/nvshare/main/kubernetes/manifests/nvshare-system.yaml && \
+kubectl delete -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/metrics-service.yaml && \
+kubectl delete -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/scheduler.yaml && \
+kubectl delete -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/device-plugin.yaml && \
+kubectl delete -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/nvshare-system-quotas.yaml && \
+kubectl delete -f https://raw.githubusercontent.com/ateleris/nvshare/main/kubernetes/manifests/nvshare-system.yaml
 ```
 
 <a name="build_local"/>

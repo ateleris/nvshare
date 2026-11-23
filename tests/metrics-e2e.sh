@@ -32,11 +32,15 @@ trap 'echo "FAIL: line $LINENO"; show_logs' ERR
 trap cleanup EXIT
 
 pod() {
-    echo "nvshare_pod_gpu_$1{gpu_device=\"nvidia0\",namespace=\"$2\",node=\"$NODE\",pod=\"$3\"${4:+,reason=\"$4\"}}"
+    echo "nvshare_pod_gpu_$1{gpu_uuid=\"GPU-e2e\",namespace=\"$2\",node=\"$NODE\",pod=\"$3\"${4:+,reason=\"$4\"}}"
 }
 
 sched() {
     echo "nvshare_scheduler_$1{node=\"$NODE\"}"
+}
+
+rejected() {
+    echo "nvshare_device_plugin_metrics_rejected_total{node=\"$NODE\",reason=\"$1\"}"
 }
 
 scrape() {
@@ -84,7 +88,7 @@ start_device_plugin() {
 make -C "$ROOT/src" nvsharectl > /dev/null
 gcc -fsanitize=address,undefined -fno-sanitize-recover=undefined -g -O1 -std=gnu99 \
     -Wall -Wextra -Werror -I"$ROOT/src" "$ROOT/src/scheduler.c" "$ROOT/src/metrics.c" \
-    "$ROOT/src/comm.c" "$ROOT/src/common.c" -o "$WORK/nvshare-scheduler" -lpthread
+    "$ROOT/src/pod_identity.c" "$ROOT/src/comm.c" "$ROOT/src/common.c" -o "$WORK/nvshare-scheduler" -lpthread
 gcc -Wall -Wextra -Werror -I"$ROOT/src" "$ROOT/tests/fake-client.c" \
     "$ROOT/src/comm.o" "$ROOT/src/common.o" -o "$WORK/fake-client"
 (cd "$ROOT/kubernetes/device-plugin" && go build -o "$WORK/nvshare-device-plugin" .)
@@ -145,6 +149,16 @@ expect_eq "$(pod clients team-c pod-c)" 0
 expect_eq "$(sched lock_queue_length)" 0
 expect_eq "$(sched clients)" 0
 expect_eq "$(sched metrics_dropped_total)" 0
+expect_eq "$(rejected version)" 0
+expect_eq "$(rejected malformed)" 0
+
+echo "== only the owner can write to the metrics socket"
+mode=$(stat -c %a /var/run/nvshare/metrics.sock)
+if [ "$mode" != 600 ]; then
+    echo "FAIL: metrics.sock has mode $mode, expected 600"
+    exit 1
+fi
+curl -fsS http://localhost:8080/healthz
 
 echo "== a restarted device plugin gets the same totals back from the scheduler"
 held_a=$(value "$(pod lock_held_seconds_total team-a pod-a)")

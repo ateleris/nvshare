@@ -12,18 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.27 as build
-COPY ./kubernetes/device-plugin/ /build
+FROM golang:1.27 AS build
 WORKDIR /build
-RUN export GO111MODULE=on && \
-    export CGO_ENABLED=0  && \
-    export GOOS=linux && \
-    go mod download && \
-    go build -a -ldflags="-s -w" -o nvshare-device-plugin
+COPY ./kubernetes/device-plugin/go.mod ./kubernetes/device-plugin/go.sum ./
+RUN go mod download
+COPY ./kubernetes/device-plugin/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o nvshare-device-plugin
 
 
-FROM alpine:3.24
+FROM scratch
 COPY --from=build /build/nvshare-device-plugin /usr/local/bin/nvshare-device-plugin
-USER root
-ENTRYPOINT ["nvshare-device-plugin"]
-
+ENTRYPOINT ["/usr/local/bin/nvshare-device-plugin"]

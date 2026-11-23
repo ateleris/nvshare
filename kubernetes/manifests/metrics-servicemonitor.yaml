@@ -1,0 +1,15 @@
+# Optional, needs the Prometheus Operator. honorLabels keeps the `namespace`
+# and `pod` labels of the metrics instead of renaming them to
+# `exported_namespace` and `exported_pod`.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nvshare-metrics
+  namespace: nvshare-system
+spec:
+  selector:
+    matchLabels:
+      app: nvshare-device-plugin
+  endpoints:
+  - port: metrics
+    honorLabels: true
