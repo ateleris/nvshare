@@ -80,6 +80,17 @@ jobs:
       - name: Build Docker image
         run: docker build -f ${{ matrix.dockerfile }} .
 
+  kind:
+    name: Kubernetes deployment test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Deploy to a kind cluster and allocate a virtual GPU
+        run: tests/kind-e2e.sh
+
   gpu-test-image:
     name: Build tests/dockerfiles/Dockerfile.gputest
     runs-on: ubuntu-latest
