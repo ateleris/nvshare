@@ -104,7 +104,7 @@ static void delete_client(struct nvshare_client *client)
 
 	/* Remove from clients list */
 	LL_FOREACH_SAFE(clients, c, tmp) {
-		if (c->fd == client->fd) {
+		if (c->fd == cfd) {
 			LL_DELETE(clients, c);
 			free(c);
 		}
