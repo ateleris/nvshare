@@ -14,6 +14,7 @@ constexpr uint32_t LCG_MULT = 1664525u;
 constexpr uint32_t LCG_PLUS = 1013904223u;
 constexpr int ROUNDS = 16;
 constexpr int THREADS = 256;
+constexpr size_t CHUNK = (size_t)16 << 20;
 constexpr double REPORT_SECONDS = 5.0;
 constexpr double MIN_WAIT_SECONDS = 1.0;
 constexpr double WAIT_FACTOR = 5.0;
@@ -147,41 +148,47 @@ int main(int argc, char **argv)
            seconds_between(start, loop_start), mem_mib);
 
     auto last_report = loop_start;
-    uint64_t iters = 0, window_iters = 0, waits = 0;
+    uint64_t passes = 0, window_passes = 0, launches = 0, waits = 0;
     double fastest = 0, waited = 0, longest = 0;
 
-    while (!stop_requested) {
-        auto t0 = std::chrono::steady_clock::now();
-        if (seconds_between(loop_start, t0) >= seconds) break;
+    while (!stop_requested &&
+           seconds_between(loop_start, std::chrono::steady_clock::now()) < seconds) {
+        for (size_t off = 0; off < n; off += CHUNK) {
+            size_t len = n - off < CHUNK ? n - off : CHUNK;
+            unsigned int chunk_blocks = (unsigned int)((len + THREADS - 1) / THREADS);
 
-        step_kernel<<<blocks, THREADS>>>(buf, n);
-        CHECK(cudaGetLastError());
-        CHECK(cudaDeviceSynchronize());
+            auto t0 = std::chrono::steady_clock::now();
+            step_kernel<<<chunk_blocks, THREADS>>>(buf + off, len);
+            CHECK(cudaGetLastError());
+            CHECK(cudaDeviceSynchronize());
+            auto t1 = std::chrono::steady_clock::now();
 
-        auto t1 = std::chrono::steady_clock::now();
-        double d = seconds_between(t0, t1);
-        iters++;
-        window_iters++;
-        if (iters == 1 || d < fastest) fastest = d;
-
-        if (d >= MIN_WAIT_SECONDS && d >= WAIT_FACTOR * fastest) {
-            waits++;
-            waited += d;
-            if (d > longest) longest = d;
-            printf("[%6.1fs] waited %.1f s for the gpu\n",
-                   seconds_between(start, t1), d);
+            double d = seconds_between(t0, t1);
+            launches++;
+            if (launches == 1 || d < fastest) fastest = d;
+            if (d >= MIN_WAIT_SECONDS && d >= WAIT_FACTOR * fastest) {
+                waits++;
+                waited += d;
+                if (d > longest) longest = d;
+                printf("[%6.1fs] waited %.1f s for the gpu\n",
+                       seconds_between(start, t1), d);
+            }
         }
-        if (seconds_between(last_report, t1) >= REPORT_SECONDS) {
-            printf("[%6.1fs] %llu iterations (%.1f/s)\n",
-                   seconds_between(start, t1), (unsigned long long)iters,
-                   window_iters / seconds_between(last_report, t1));
-            last_report = t1;
-            window_iters = 0;
+        passes++;
+        window_passes++;
+
+        auto now = std::chrono::steady_clock::now();
+        if (seconds_between(last_report, now) >= REPORT_SECONDS) {
+            printf("[%6.1fs] %llu passes (%.1f/s)\n",
+                   seconds_between(start, now), (unsigned long long)passes,
+                   window_passes / seconds_between(last_report, now));
+            last_report = now;
+            window_passes = 0;
         }
     }
 
     uint32_t mult, plus;
-    lcg_skip(iters * ROUNDS, &mult, &plus);
+    lcg_skip(passes * ROUNDS, &mult, &plus);
     CHECK(cudaMemcpy(bad_dev, &bad, sizeof(bad), cudaMemcpyHostToDevice));
     verify_kernel<<<blocks, THREADS>>>(buf, n, mult, plus, bad_dev);
     CHECK(cudaGetLastError());
@@ -189,7 +196,8 @@ int main(int argc, char **argv)
     CHECK(cudaMemcpy(&bad, bad_dev, sizeof(bad), cudaMemcpyDeviceToHost));
 
     double elapsed = seconds_between(start, std::chrono::steady_clock::now());
-    printf("iterations: %llu in %.1f s\n", (unsigned long long)iters, elapsed);
+    printf("passes over the memory: %llu in %.1f s\n",
+           (unsigned long long)passes, elapsed);
     printf("waited for the gpu: %.1f s in %llu waits (longest %.1f s)\n",
            waited, (unsigned long long)waits, longest);
     if (bad != 0) {

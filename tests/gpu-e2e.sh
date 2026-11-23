@@ -11,6 +11,7 @@ BIN=$(cd "$1" && pwd)
 MEM_MIB=${MEM_MIB:-2048}
 DURATION=${DURATION:-40}
 TQ=${TQ:-5}
+MIN_FREE_MIB=1024
 
 LOGS=$(mktemp -d)
 SOCK=/var/run/nvshare/scheduler.sock
@@ -46,7 +47,12 @@ wait_for_log() {
     return 1
 }
 
-nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+nvidia-smi --query-gpu=name,driver_version,memory.used,memory.total,utilization.gpu --format=csv,noheader
+free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
+if [ "$free" -lt "$MIN_FREE_MIB" ]; then
+    echo "FAIL: gpu has only $free MiB free, need $MIN_FREE_MIB (in use by other processes?)"
+    exit 1
+fi
 
 rm -f "$SOCK"
 "$BIN/nvshare-scheduler" > "$LOGS/scheduler.log" 2>&1 &
@@ -91,6 +97,9 @@ for n in 1 2; do
     [ "${waits:-0}" -ge 1 ] || fail "workload $n never waited for the gpu"
 done
 
+while read -r id; do
+    grep -q "Sent LOCK_OK to client $id" "$LOGS/scheduler.log" || fail "client $id never got the lock"
+done < <(sed -n 's/.*Registered client \([0-9a-f]*\) .*/\1/p' "$LOGS/scheduler.log")
 registered=$(grep -c "Registered client" "$LOGS/scheduler.log")
 drops=$(grep -c "Sent DROP_LOCK" "$LOGS/scheduler.log")
 [ "$registered" -eq 2 ] || fail "scheduler registered $registered clients, expected 2"
