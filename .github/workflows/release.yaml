@@ -1,0 +1,84 @@
+name: Release images
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build again, e.g. v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/ateleris/nvshare
+
+jobs:
+  build:
+    name: Build ${{ matrix.component }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: scheduler
+            dockerfile: Dockerfile.scheduler
+          - component: device-plugin
+            dockerfile: Dockerfile.device_plugin
+          - component: libnvshare
+            dockerfile: Dockerfile.libnvshare
+          - component: gpu-test
+            dockerfile: tests/dockerfiles/Dockerfile.gputest
+    steps:
+      - name: Work out image tags
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "tag '$TAG' is not a version like v1.2.3"
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "image=$IMAGE:$COMPONENT-$TAG"
+            echo "tags<<EOF"
+            echo "$IMAGE:$COMPONENT-$TAG"
+            case "$TAG" in
+              *-*) ;;
+              *) echo "$IMAGE:$COMPONENT-latest" ;;
+            esac
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.version.outputs.tags }}
+
+      - name: Report image digest
+        env:
+          PUSHED: ${{ steps.version.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "\`$PUSHED@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
