@@ -14,14 +14,46 @@
 #include "utlist.h"
 #include "comm.h"
 
+enum client_state {
+	CLIENT_IDLE,
+	CLIENT_WAITING,
+	CLIENT_HOLDING,
+};
+
+struct metrics_pod {
+	char namespace[POD_NAMESPACE_LEN_MAX];
+	char pod_name[POD_NAME_LEN_MAX];
+	uint32_t clients;
+	uint64_t held_ms;
+	uint64_t wait_ms;
+	uint64_t acquisitions;
+	uint64_t releases[METRICS_RELEASE_REASONS];
+	struct timespec empty_since;
+	struct metrics_pod *next;
+};
+
+struct metrics_client {
+	uint64_t id;
+	struct metrics_pod *pod;
+	enum client_state state;
+	int drop_sent;
+	struct timespec since;
+	struct metrics_client *next;
+};
+
 /*
  * All state here is protected by the scheduler's global_mutex (every caller
  * into this module -- scheduler.c -- holds it). No local mutex is required.
  */
 static int socket_fd = -1;
-static struct pod_gpu_session *active_sessions = NULL;
+static struct metrics_pod *pods = NULL;
+static struct metrics_client *tracked = NULL;
+static int sched_on;
+static int sched_tq;
+static uint64_t dropped_messages;
 
-static int try_connect_socket(void) {
+static int try_connect_socket(void)
+{
 	int fd;
 	struct sockaddr_un addr;
 
@@ -53,185 +85,318 @@ static int try_connect_socket(void) {
 	return 0;
 }
 
-static void close_socket(void) {
+static void close_socket(void)
+{
 	if (socket_fd >= 0) {
 		close(socket_fd);
 		socket_fd = -1;
 	}
 }
 
-int metrics_init(void) {
-	log_info("Initializing metrics system...");
-	if (try_connect_socket() < 0) {
-		log_warn("METRICS: Device plugin socket not yet available; will retry on first event");
-	}
-	return 0;
-}
-
-static int send_metrics_message(const struct metrics_message *msg) {
+static int try_send(const void *msg, size_t len)
+{
 	ssize_t sent;
 
-	if (socket_fd < 0 && try_connect_socket() < 0) {
+	if (socket_fd < 0 && try_connect_socket() < 0)
 		return -1;
-	}
 
-	sent = send(socket_fd, msg, sizeof(*msg), MSG_DONTWAIT | MSG_NOSIGNAL);
+	sent = send(socket_fd, msg, len, MSG_DONTWAIT | MSG_NOSIGNAL);
 	if (sent < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			/* Transient, don't tear down a working connection. */
+		/* Receiver is busy. Keep the connection, the next message repairs it. */
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			return -1;
-		}
 
-		/* Connection broke (EPIPE, ECONNREFUSED, ENOTCONN, etc.).
-		 * Tear down and attempt reconnect + one retry. */
-		log_warn("METRICS: send failed (%s), reconnecting", strerror(errno));
+		/* Connection broke (the device plugin restarted). Reconnect, retry once. */
+		log_debug("METRICS: send failed (%s), reconnecting", strerror(errno));
 		close_socket();
-		if (try_connect_socket() < 0) return -1;
+		if (try_connect_socket() < 0)
+			return -1;
 
-		sent = send(socket_fd, msg, sizeof(*msg), MSG_DONTWAIT | MSG_NOSIGNAL);
+		sent = send(socket_fd, msg, len, MSG_DONTWAIT | MSG_NOSIGNAL);
 		if (sent < 0) {
-			log_warn("METRICS: send retry failed: %s", strerror(errno));
 			close_socket();
 			return -1;
 		}
 	}
 
-	if (sent != (ssize_t)sizeof(*msg)) {
-		log_warn("METRICS: partial send (%zd/%zu)", sent, sizeof(*msg));
-		return -1;
-	}
-
-	return 0;
+	return (sent == (ssize_t)len) ? 0 : -1;
 }
 
-static struct pod_gpu_session *find_session(uint64_t client_id, const char *device_id) {
-	struct pod_gpu_session *s;
-	LL_FOREACH(active_sessions, s) {
-		if (s->client_id == client_id && strcmp(s->device_id, device_id) == 0)
-			return s;
+static void send_message(const void *msg, size_t len)
+{
+	if (try_send(msg, len) < 0)
+		dropped_messages++;
+}
+
+static struct timespec now_ts(void)
+{
+	struct timespec ts;
+
+	true_or_exit(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+	return ts;
+}
+
+static uint64_t elapsed_ms(const struct timespec *start, const struct timespec *end)
+{
+	int64_t ms = (int64_t)(end->tv_sec - start->tv_sec) * 1000;
+
+	ms += ((int64_t)end->tv_nsec - (int64_t)start->tv_nsec) / 1000000;
+	return (ms < 0) ? 0 : (uint64_t)ms;
+}
+
+static struct metrics_client *find_client(uint64_t id)
+{
+	struct metrics_client *c;
+
+	LL_FOREACH(tracked, c) {
+		if (c->id == id)
+			return c;
 	}
 	return NULL;
 }
 
-static int64_t elapsed_ms(const struct timespec *start, const struct timespec *now) {
-	int64_t ms = (int64_t)(now->tv_sec - start->tv_sec) * 1000;
-	ms += ((int64_t)now->tv_nsec - (int64_t)start->tv_nsec) / 1000000;
-	if (ms < 0) ms = 0;
-	return ms;
+static struct metrics_pod *find_pod(const char *namespace, const char *pod_name)
+{
+	struct metrics_pod *p;
+
+	LL_FOREACH(pods, p) {
+		if (strcmp(p->namespace, namespace) == 0 &&
+		    strcmp(p->pod_name, pod_name) == 0)
+			return p;
+	}
+	return NULL;
 }
 
-static void fill_message(struct metrics_message *msg,
-			 uint32_t type,
-			 const char *ns, const char *pod,
-			 const char *device_id,
-			 uint64_t client_id,
-			 int64_t duration_ms) {
-	memset(msg, 0, sizeof(*msg));
-	msg->version = METRICS_PROTOCOL_VERSION;
-	msg->type = type;
-	strlcpy(msg->namespace, ns, sizeof(msg->namespace));
-	strlcpy(msg->pod_name, pod, sizeof(msg->pod_name));
-	strlcpy(msg->device_id, device_id, sizeof(msg->device_id));
-	msg->client_id = client_id;
-	msg->duration_ms = duration_ms;
+static void publish_pod(const struct metrics_pod *pod, const struct timespec *now)
+{
+	struct metrics_pod_stats msg;
+	struct metrics_client *c;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.version = METRICS_PROTOCOL_VERSION;
+	msg.type = METRICS_POD_STATS;
+	strlcpy(msg.namespace, pod->namespace, sizeof(msg.namespace));
+	strlcpy(msg.pod_name, pod->pod_name, sizeof(msg.pod_name));
+	msg.clients = pod->clients;
+	msg.held_ms = pod->held_ms;
+	msg.wait_ms = pod->wait_ms;
+	msg.acquisitions = pod->acquisitions;
+	memcpy(msg.releases, pod->releases, sizeof(msg.releases));
+
+	LL_FOREACH(tracked, c) {
+		if (c->pod != pod)
+			continue;
+		if (c->state == CLIENT_HOLDING) {
+			msg.holding = 1;
+			msg.held_ms += elapsed_ms(&c->since, now);
+		} else if (c->state == CLIENT_WAITING) {
+			msg.waiting++;
+			msg.wait_ms += elapsed_ms(&c->since, now);
+		}
+	}
+
+	send_message(&msg, sizeof(msg));
 }
 
-int metrics_lock_acquired(const struct nvshare_client *client, const char *device_id) {
-	struct pod_gpu_session *session;
-	struct metrics_message msg;
-	struct timespec now;
+static void publish_sched(void)
+{
+	struct metrics_sched_stats msg;
+	struct metrics_client *c;
 
-	if (!client || !device_id || device_id[0] == '\0') return -1;
-	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+	memset(&msg, 0, sizeof(msg));
+	msg.version = METRICS_PROTOCOL_VERSION;
+	msg.type = METRICS_SCHED_STATS;
+	msg.scheduler_on = sched_on ? 1 : 0;
+	msg.tq_sec = (uint32_t)sched_tq;
+	msg.dropped_messages = dropped_messages;
 
-	session = find_session(client->id, device_id);
-	if (session != NULL) {
-		/* Already holding lock for this device. Refresh start time;
-		 * the previous hold's duration is lost, but the alternative
-		 * (double-counting) is worse. */
-		session->start_time = now;
-		log_debug("METRICS: refresh acquire for client %lx", client->id);
-		return 0;
+	LL_FOREACH(tracked, c) {
+		msg.clients++;
+		if (c->state == CLIENT_WAITING)
+			msg.queue_length++;
 	}
 
-	session = malloc(sizeof(*session));
-	if (!session) {
-		log_warn("METRICS: failed to allocate session");
-		return -1;
+	send_message(&msg, sizeof(msg));
+}
+
+static void publish_client(const struct metrics_client *c, const struct timespec *now)
+{
+	publish_pod(c->pod, now);
+	publish_sched();
+}
+
+/* Close whatever the client is doing and account for it in its pod. */
+static void leave_state(struct metrics_client *c, const struct timespec *now,
+			enum metrics_release_reason reason)
+{
+	if (c->state == CLIENT_HOLDING) {
+		c->pod->held_ms += elapsed_ms(&c->since, now);
+		c->pod->releases[reason]++;
+	} else if (c->state == CLIENT_WAITING) {
+		c->pod->wait_ms += elapsed_ms(&c->since, now);
 	}
+	c->state = CLIENT_IDLE;
+	c->drop_sent = 0;
+}
 
-	strlcpy(session->namespace, client->pod_namespace, sizeof(session->namespace));
-	strlcpy(session->pod_name, client->pod_name, sizeof(session->pod_name));
-	strlcpy(session->device_id, device_id, sizeof(session->device_id));
-	session->client_id = client->id;
-	session->start_time = now;
-	LL_APPEND(active_sessions, session);
+void metrics_init(int scheduler_on, int tq)
+{
+	sched_on = scheduler_on;
+	sched_tq = tq;
+	if (try_connect_socket() < 0)
+		log_info("METRICS: Device plugin socket not yet available; will keep retrying");
+}
 
-	fill_message(&msg, METRICS_LOCK_ACQUIRED,
-		     client->pod_namespace, client->pod_name,
-		     device_id, client->id, 0);
-	send_metrics_message(&msg);
-	log_info("METRICS: lock acquired by %s/%s", client->pod_namespace, client->pod_name);
-	return 0;
+void metrics_client_registered(const struct nvshare_client *client)
+{
+	struct metrics_client *c;
+	struct metrics_pod *pod;
+	struct timespec now = now_ts();
+
+	if (find_client(client->id) != NULL)
+		return;
+
+	pod = find_pod(client->pod_namespace, client->pod_name);
+	if (pod == NULL) {
+		true_or_exit(pod = calloc(1, sizeof(*pod)));
+		strlcpy(pod->namespace, client->pod_namespace, sizeof(pod->namespace));
+		strlcpy(pod->pod_name, client->pod_name, sizeof(pod->pod_name));
+		LL_APPEND(pods, pod);
+	}
+	pod->clients++;
+
+	true_or_exit(c = calloc(1, sizeof(*c)));
+	c->id = client->id;
+	c->pod = pod;
+	c->state = CLIENT_IDLE;
+	LL_APPEND(tracked, c);
+
+	publish_client(c, &now);
+}
+
+void metrics_client_removed(const struct nvshare_client *client)
+{
+	struct metrics_client *c = find_client(client->id);
+	struct metrics_pod *pod;
+	struct timespec now = now_ts();
+
+	/* Clients that never registered (nvsharectl) are not tracked. */
+	if (c == NULL)
+		return;
+
+	leave_state(c, &now, METRICS_RELEASE_EXIT);
+	pod = c->pod;
+	pod->clients--;
+	if (pod->clients == 0)
+		pod->empty_since = now;
+
+	LL_DELETE(tracked, c);
+	free(c);
+
+	publish_pod(pod, &now);
+	publish_sched();
+}
+
+void metrics_lock_requested(const struct nvshare_client *client)
+{
+	struct metrics_client *c = find_client(client->id);
+	struct timespec now = now_ts();
+
+	if (c == NULL || c->state != CLIENT_IDLE)
+		return;
+
+	c->state = CLIENT_WAITING;
+	c->since = now;
+	publish_client(c, &now);
+}
+
+void metrics_lock_acquired(const struct nvshare_client *client)
+{
+	struct metrics_client *c = find_client(client->id);
+	struct timespec now = now_ts();
+
+	if (c == NULL || c->state == CLIENT_HOLDING)
+		return;
+
+	if (c->state == CLIENT_WAITING)
+		c->pod->wait_ms += elapsed_ms(&c->since, &now);
+	c->state = CLIENT_HOLDING;
+	c->since = now;
+	c->drop_sent = 0;
+	c->pod->acquisitions++;
+	publish_client(c, &now);
+}
+
+void metrics_drop_sent(const struct nvshare_client *client)
+{
+	struct metrics_client *c = find_client(client->id);
+
+	if (c != NULL && c->state == CLIENT_HOLDING)
+		c->drop_sent = 1;
+}
+
+void metrics_lock_released(const struct nvshare_client *client)
+{
+	struct metrics_client *c = find_client(client->id);
+	struct timespec now = now_ts();
+
+	if (c == NULL || c->state == CLIENT_IDLE)
+		return;
+
+	leave_state(c, &now, c->drop_sent ? METRICS_RELEASE_QUANTUM : METRICS_RELEASE_IDLE);
+	publish_client(c, &now);
 }
 
 /*
- * Emit a LOCK_RELEASED for the given session. Caller must LL_DELETE the
- * session from active_sessions before calling; this function does not
- * touch the list and does not free the session.
+ * When the scheduler is turned off every client runs freely and the
+ * requests list is discarded, so close all holds and waits.
  */
-static void emit_release_for_session(struct pod_gpu_session *session,
-				      const struct timespec *now) {
-	struct metrics_message msg;
-	int64_t duration_ms = elapsed_ms(&session->start_time, now);
+void metrics_scheduler_state(int scheduler_on, int tq)
+{
+	struct metrics_client *c;
+	struct metrics_pod *pod;
+	struct timespec now = now_ts();
 
-	fill_message(&msg, METRICS_LOCK_RELEASED,
-		     session->namespace, session->pod_name,
-		     session->device_id, session->client_id, duration_ms);
-	send_metrics_message(&msg);
-	log_info("METRICS: lock released by %s/%s after %lld ms",
-		 session->namespace, session->pod_name, (long long)duration_ms);
-}
-
-int metrics_lock_released(const struct nvshare_client *client, const char *device_id) {
-	struct pod_gpu_session *session;
-	struct timespec now;
-
-	if (!client || !device_id || device_id[0] == '\0') return -1;
-	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
-
-	session = find_session(client->id, device_id);
-	if (!session) {
-		log_debug("METRICS: release without active session for client %lx", client->id);
-		return 0;
+	if (sched_on && !scheduler_on) {
+		LL_FOREACH(tracked, c)
+			leave_state(c, &now, METRICS_RELEASE_OFF);
+		LL_FOREACH(pods, pod)
+			publish_pod(pod, &now);
 	}
 
-	LL_DELETE(active_sessions, session);
-	emit_release_for_session(session, &now);
-	free(session);
-	return 0;
+	sched_on = scheduler_on;
+	sched_tq = tq;
+	publish_sched();
 }
 
-/*
- * Emit LOCK_RELEASED for every currently-active session and drop them.
- * Used when the scheduler transitions to SCHED_OFF (lock holder is about
- * to be invalidated) and on graceful shutdown (SIGTERM).
- */
-void metrics_flush_all(void) {
-	struct pod_gpu_session *session, *tmp;
-	struct timespec now;
+void metrics_tick(void)
+{
+	struct metrics_pod *pod, *tmp;
+	struct timespec now = now_ts();
 
-	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
-
-	LL_FOREACH_SAFE(active_sessions, session, tmp) {
-		LL_DELETE(active_sessions, session);
-		emit_release_for_session(session, &now);
-		free(session);
+	LL_FOREACH_SAFE(pods, pod, tmp) {
+		if (pod->clients == 0 &&
+		    elapsed_ms(&pod->empty_since, &now) >
+		    (uint64_t)METRICS_POD_RETENTION_SEC * 1000) {
+			LL_DELETE(pods, pod);
+			free(pod);
+			continue;
+		}
+		publish_pod(pod, &now);
 	}
+	publish_sched();
 }
 
-void metrics_cleanup(void) {
-	metrics_flush_all();
+void metrics_cleanup(void)
+{
+	struct metrics_client *c;
+	struct metrics_pod *pod;
+	struct timespec now = now_ts();
+
+	LL_FOREACH(tracked, c)
+		leave_state(c, &now, METRICS_RELEASE_OFF);
+	LL_FOREACH(pods, pod)
+		publish_pod(pod, &now);
+	publish_sched();
 	close_socket();
-	log_info("Metrics system cleaned up");
 }

@@ -24,7 +24,8 @@ jobs:
       - name: Check metrics wire format against golden file
         run: |
           gcc -Isrc kubernetes/device-plugin/testdata/gen_wire_golden.c src/common.o -o gen_wire_golden
-          ./gen_wire_golden | cmp - kubernetes/device-plugin/testdata/wire_golden.bin
+          ./gen_wire_golden pod | cmp - kubernetes/device-plugin/testdata/pod_stats_golden.bin
+          ./gen_wire_golden sched | cmp - kubernetes/device-plugin/testdata/sched_stats_golden.bin
 
       - name: Upload binaries
         uses: actions/upload-artifact@v7
@@ -79,6 +80,17 @@ jobs:
 
       - name: Build Docker image
         run: docker build -f ${{ matrix.dockerfile }} .
+
+  metrics:
+    name: Metrics end-to-end test
+    runs-on: ubuntu-latest
+    container: golang:1.27
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run scheduler, device plugin and fake clients
+        run: tests/metrics-e2e.sh
 
   kind:
     name: Kubernetes deployment test

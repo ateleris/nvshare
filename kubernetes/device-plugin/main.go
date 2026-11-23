@@ -122,7 +122,7 @@ func main() {
 
 	metricsCollector = NewMetricsCollector(8080)
 	if err := metricsCollector.StartMetricsServer(); err != nil {
-		log.Printf("Failed to start metrics server: %v", err)
+		log.Fatalf("Failed to start metrics server: %v", err)
 	}
 
 	log.Println("Starting FS watcher.")

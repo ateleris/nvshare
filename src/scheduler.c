@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
+#include <sys/timerfd.h>
 #include <signal.h>
 #include <time.h>
 #include <stdio.h>
@@ -57,6 +58,9 @@ int epoll_fd;
 
 /* signalfd for graceful shutdown (SIGTERM/SIGINT) */
 int sig_fd;
+
+/* timerfd for the periodic metrics refresh */
+int metrics_fd;
 
 
 struct nvshare_client *clients = NULL;
@@ -99,8 +103,7 @@ static void delete_client(struct nvshare_client *client)
 	log_info("Removing client %s", id_str);
 	remove_req(client);
 
-	/* If this client was holding the lock, close out the lock-hold period. */
-	metrics_lock_released(client, "nvidia0");
+	metrics_client_removed(client);
 
 	/* Remove from clients list */
 	LL_FOREACH_SAFE(clients, c, tmp) {
@@ -130,6 +133,7 @@ static void insert_req(struct nvshare_client *client)
 	r->next = NULL;
 	r->client = client;
 	LL_APPEND(requests, r);
+	metrics_lock_requested(client);
 }
 
 static void remove_req(struct nvshare_client *client)
@@ -309,7 +313,7 @@ try_again:
 		must_reset_timer = 1;
 		pthread_cond_broadcast(&timer_cv);
 
-		metrics_lock_acquired(requests->client, "nvidia0");
+		metrics_lock_acquired(requests->client);
 	}
 }
 
@@ -372,6 +376,7 @@ remainder:
 				drop_lock_sent = 0;
 			} else { /* All good */
 				drop_lock_sent = 1;
+				metrics_drop_sent(requests->client);
 			}
 		} else if (ret != 0) { /* Unrecoverable error */
 			errno = ret;
@@ -402,9 +407,12 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			   message_type_string[in_msg->type]);
 
 		if (register_client(client, in_msg) < 0) delete_client(client);
-		else log_info("Registered client %016" PRIx64 " with Pod"
-			      " name = %s, Pod namespace = %s", client->id,
-			      client->pod_name, client->pod_namespace);
+		else {
+			log_info("Registered client %016" PRIx64 " with Pod"
+				 " name = %s, Pod namespace = %s", client->id,
+				 client->pod_name, client->pod_namespace);
+			metrics_client_registered(client);
+		}
 		break;
 
 	case SCHED_ON: /* nvsharectl */
@@ -419,6 +427,7 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			scheduler_on = 1;
 			log_info("Scheduler turned ON, broadcasting it...");
 			bcast_status();
+			metrics_scheduler_state(scheduler_on, tq);
 		}
 		break;
 
@@ -435,11 +444,11 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			 * have the lock, so the requests list instantaneously
 			 * becomes invalid. Empty it.
 			 *
-			 * Before emptying, flush any in-flight metrics hold
+			 * Before emptying, close any hold or wait in progress
 			 * so the current lock holder's time is billed (not
 			 * silently dropped when their request is freed).
 			 */
-			metrics_flush_all();
+			metrics_scheduler_state(scheduler_on, tq);
 			struct nvshare_request *tmp, *r;
 			LL_FOREACH_SAFE(requests, r, tmp) {
 				LL_DELETE(requests, r);
@@ -460,6 +469,7 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			must_reset_timer = 1;
 			pthread_cond_broadcast(&timer_cv); /* Reset timer on TQ change */
 			log_info("New TQ = %d", tq);
+			metrics_scheduler_state(scheduler_on, tq);
 		}
 		else log_info("Failed to parse new TQ from message");
 		break;
@@ -488,7 +498,7 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			 * are meaningless. Mostly a sanity check.
 			 */
 			if (scheduler_on) {
-				metrics_lock_released(client, "nvidia0");
+				metrics_lock_released(client);
 				remove_req(client);
 				if (!lock_held) try_schedule();
 			}
@@ -561,7 +571,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	true_or_exit(pthread_mutex_init(&global_mutex, NULL) == 0);
 	true_or_exit(pthread_cond_init(&timer_cv, NULL) == 0);
 
-	metrics_init();
+	metrics_init(scheduler_on, tq);
 
 	/*
 	 * Install a signalfd for SIGTERM/SIGINT. The signals are blocked
@@ -601,6 +611,20 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	event.data.fd = sig_fd;
 	event.events = EPOLLIN;
 	true_or_exit(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sig_fd, &event) == 0);
+
+	/* Periodic metrics refresh */
+	{
+		struct itimerspec its = {
+			.it_interval = { .tv_sec = METRICS_TICK_SEC },
+			.it_value = { .tv_sec = METRICS_TICK_SEC },
+		};
+		metrics_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+		true_or_exit(metrics_fd >= 0);
+		true_or_exit(timerfd_settime(metrics_fd, 0, &its, NULL) == 0);
+		event.data.fd = metrics_fd;
+		event.events = EPOLLIN;
+		true_or_exit(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, metrics_fd, &event) == 0);
+	}
 
 	/*
 	 * According to man unix(7):
@@ -642,6 +666,12 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 					log_info("Received signal %u, shutting down", si.ssi_signo);
 				}
 				shutdown_requested = 1;
+				continue;
+			}
+			if (events[i].data.fd == metrics_fd) {
+				uint64_t expirations;
+				if (read(metrics_fd, &expirations, sizeof(expirations)) > 0)
+					metrics_tick();
 				continue;
 			}
 			if (events[i].data.fd == lsock) {
@@ -706,7 +736,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	}
 
 	/*
-	 * Graceful shutdown (SIGTERM/SIGINT). Flush in-flight metrics so
+	 * Graceful shutdown (SIGTERM/SIGINT). Publish final metrics so
 	 * the current lock holder's accrued hold time is billed rather
 	 * than dropped on pod restart / rolling upgrade. Hold global_mutex
 	 * across the flush so the timer thread cannot race with us.
