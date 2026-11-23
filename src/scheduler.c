@@ -169,14 +169,17 @@ static int register_client(struct nvshare_client *client, const struct message *
 		return -1;
 	}
 
-	strlcpy(client->pod_name, in_msg->pod_name,
-		sizeof(client->pod_name));
-	strlcpy(client->pod_namespace, in_msg->pod_namespace,
-		sizeof(client->pod_namespace));
-	if (pod_identity_verify(client->fd, client->pod_namespace,
-				sizeof(client->pod_namespace), client->pod_name,
-				sizeof(client->pod_name)) < 0)
+	if (client->pod_verified < 0) {
+		log_warn("Rejecting a client whose process was gone before its"
+			 " pod could be determined");
 		return -1;
+	}
+	if (!client->pod_verified) {
+		strlcpy(client->pod_name, in_msg->pod_name,
+			sizeof(client->pod_name));
+		strlcpy(client->pod_namespace, in_msg->pod_namespace,
+			sizeof(client->pod_namespace));
+	}
 
 again:
 	nvshare_client_id = nvshare_generate_id();
@@ -689,6 +692,11 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 					client->fd = rsock;
 					client->id = NVSHARE_UNREGISTERED_ID;
 					client->next = NULL;
+					client->pod_verified = pod_identity_of_peer(
+						rsock, client->pod_namespace,
+						sizeof(client->pod_namespace),
+						client->pod_name,
+						sizeof(client->pod_name));
 
 					/*
 					 * 2. Add new rsock to the epoll

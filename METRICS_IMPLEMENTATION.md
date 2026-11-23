@@ -59,7 +59,7 @@ From the device plugin itself, with labels `node`, `reason`:
 
 ## Pod identity
 
-The client library reports a pod name (from `HOSTNAME`) and a namespace (from the service account mount), but a pod controls both. The scheduler therefore does not trust them on Kubernetes. When a client registers, the scheduler:
+The client library reports a pod name (from `HOSTNAME`) and a namespace (from the service account mount), but a pod controls both. The scheduler therefore does not trust them on Kubernetes. When a client connects, the scheduler:
 
 1. asks the kernel for the process at the other end of the socket (`SO_PEERCRED`),
 2. reads the pod UID from that process's cgroup (`/proc/<pid>/cgroup`),
@@ -74,7 +74,7 @@ This needs `hostPID: true` and a read-only mount of `/var/log/pods` on the sched
 | Client does not run in a pod (local use without Kubernetes) | What the client reported, `none` / `none` by default. |
 | Scheduler is not in the host PID namespace | What the client reported. **Not verified**: a pod can report a false identity. The scheduler logs a warning once. |
 
-A client whose process is gone before the scheduler could inspect it is rejected.
+The lookup happens when the client connects, not when it registers, so a client cannot wait for its process ID to be reused by another pod before registering. A client whose process is gone before the scheduler could inspect it cannot register. On Linux 6.5 and newer the scheduler also holds a handle to the process (`SO_PEERPIDFD`) to make sure the process it inspected is the one that connected. On older kernels a process ID reused in the instant between connecting and the lookup would go unnoticed.
 
 The metrics socket (`/var/run/nvshare/metrics.sock`) has mode 0600, so the scheduler and the device plugin must run as the same user (root in the provided manifests), and no other user on the node can inject metrics.
 
