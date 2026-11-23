@@ -19,21 +19,24 @@ package main
 
 import (
 	"context"
-	"path"
-	"path/filepath"
-	"time"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"path"
+	"path/filepath"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
 const (
 	resourceName = "nvshare.com/gpu"
 	serverSock   = pluginapi.DevicePluginPath + "nvshare-device-plugin.sock"
+
+	registerTimeout = 5 * time.Second
 )
 
 type NvshareDevicePlugin struct {
@@ -121,44 +124,21 @@ func (m *NvshareDevicePlugin) Serve() error {
 
 	pluginapi.RegisterDevicePluginServer(m.server, m)
 
+	server := m.server
 	go func() {
-		lastCrashTime := time.Now()
-		restartCount := 0
-		for {
-			log.Printf("Starting gRPC server for '%s'", resourceName)
-			err := m.server.Serve(sock)
-			if err == nil {
-				break
-			}
-
-			log.Printf("GRPC server for '%s' crashed with error: %v",
-				resourceName, err)
-
-			if restartCount > 5 {
-				log.Fatalf("GRPC server for '%s' has repeatedly crashed recently. Quitting", resourceName)
-			}
-			timeSinceLastCrash := time.Since(lastCrashTime).Seconds()
-			lastCrashTime = time.Now()
-			if timeSinceLastCrash > 3600 {
-				restartCount = 1
-			} else {
-				restartCount++
-			}
+		log.Printf("Starting gRPC server for '%s'", resourceName)
+		if err := server.Serve(sock); err != nil {
+			log.Fatalf("gRPC server for '%s' failed: %v", resourceName, err)
 		}
 	}()
-
-	conn, err := m.dial(m.socket, 5*time.Second)
-	if err != nil {
-		return err
-	}
-	conn.Close()
 
 	return nil
 }
 
 /* Registers the device plugin for resourceName with kubelet */
 func (m *NvshareDevicePlugin) Register() error {
-	conn, err := m.dial(pluginapi.KubeletSocket, 5*time.Second)
+	conn, err := grpc.NewClient("unix://"+pluginapi.KubeletSocket,
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
 	}
@@ -174,13 +154,11 @@ func (m *NvshareDevicePlugin) Register() error {
 		},
 	}
 
-	_, err = client.Register(context.Background(), reqt)
-	if err != nil {
-		return err
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), registerTimeout)
+	defer cancel()
+	_, err = client.Register(ctx, reqt)
+	return err
 }
-
 
 func (m *NvshareDevicePlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	options := &pluginapi.DevicePluginOptions{
@@ -204,14 +182,15 @@ func (m *NvshareDevicePlugin) GetDevicePluginOptions(context.Context, *pluginapi
  * https://github.com/kubernetes/community/blob/c4466d9fbfa6645410083e37560810a9aa000267/contributors/design-proposals/resource-management/device-plugin.md#healthcheck-and-failure-recovery
  */
 func (m *NvshareDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
-	s.Send(&pluginapi.ListAndWatchResponse{Devices: m.devs})
-	log.Printf("Sent ListAndWatchResponse with DeviceIDs")
-	for {
-		select {
-		case <-m.stop:
-			return nil
-		}
+	if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: m.devs}); err != nil {
+		return err
 	}
+	log.Printf("Sent ListAndWatchResponse with DeviceIDs")
+	select {
+	case <-m.stop:
+	case <-s.Context().Done():
+	}
+	return nil
 }
 
 /*
@@ -219,7 +198,6 @@ func (m *NvshareDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Devic
  * has requested an Nvshare GPU.
  */
 func (m *NvshareDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
-	log.SetOutput(os.Stderr)
 	responses := pluginapi.AllocateResponse{}
 	for _, req := range reqs.ContainerRequests {
 		for _, id := range req.DevicesIds {
@@ -231,10 +209,9 @@ func (m *NvshareDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Allo
 
 		response := pluginapi.ContainerAllocateResponse{}
 
-		var envsMap map[string]string
-		envsMap = make(map[string]string)
+		envsMap := make(map[string]string)
 		envsMap["LD_PRELOAD"] = LibNvshareContainerPath
-		if nvidiaRuntimeUseMounts == false {
+		if !nvidiaRuntimeUseMounts {
 			envsMap[NvidiaDevicesEnvVar] = UUID
 		} else {
 			envsMap[NvidiaDevicesEnvVar] = NvidiaExposeMountDir
@@ -263,7 +240,7 @@ func (m *NvshareDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Allo
 		 * container runtime is through Volume Mounts, set symbolic /dev/null
 		 * mount for GPU exposure
 		 */
-		if nvidiaRuntimeUseMounts == true {
+		if nvidiaRuntimeUseMounts {
 			mount = &pluginapi.Mount{
 				HostPath:      NvidiaExposeMountHostPath,
 				ContainerPath: filepath.Join(NvidiaExposeMountDir, UUID),
@@ -290,22 +267,6 @@ func (m *NvshareDevicePlugin) PreStartContainer(context.Context, *pluginapi.PreS
 	return response, nil
 }
 
-/* Establish a gRPC communication with an entity over a UNIX socket */
-func (m *NvshareDevicePlugin) dial(unixSocketPath string, timeout time.Duration) (*grpc.ClientConn, error) {
-	c, err := grpc.Dial(unixSocketPath, grpc.WithInsecure(), grpc.WithBlock(),
-		grpc.WithTimeout(timeout),
-		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-			return net.DialTimeout("unix", addr, timeout)
-		}),
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return c, nil
-}
-
 func (m *NvshareDevicePlugin) deviceExists(id string) bool {
 	for _, d := range m.devs {
 		if d.ID == id {
@@ -314,4 +275,3 @@ func (m *NvshareDevicePlugin) deviceExists(id string) bool {
 	}
 	return false
 }
-

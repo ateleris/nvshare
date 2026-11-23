@@ -9,6 +9,7 @@ struct nvshare_client {
 	uint64_t id;
 	char pod_name[POD_NAME_LEN_MAX];
 	char pod_namespace[POD_NAMESPACE_LEN_MAX];
+	int pod_verified;
 	struct nvshare_client *next;
 };
 

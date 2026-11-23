@@ -27,9 +27,12 @@ spec:
         name: nvshare-scheduler
     spec:
       priorityClassName: system-node-critical
+      # The scheduler looks up the pod of each client process, so tenants
+      # cannot report a false pod identity in the metrics.
+      hostPID: true
       containers:
       - name: nvshare-scheduler
-        image: ghcr.io/ateleris/nvshare:scheduler-latest
+        image: ghcr.io/ateleris/nvshare:scheduler-v1.1.0
         imagePullPolicy: IfNotPresent
         securityContext:
           allowPrivilegeEscalation: false
@@ -38,11 +41,18 @@ spec:
         volumeMounts:
           - name: nvshare-socket-directory
             mountPath: /var/run/nvshare
+          - name: pod-logs
+            mountPath: /var/log/pods
+            readOnly: true
       volumes:
         - name: nvshare-socket-directory
           hostPath:
             path: /var/run/nvshare
             type: DirectoryOrCreate
+        - name: pod-logs
+          hostPath:
+            path: /var/log/pods
+            type: Directory
       tolerations:
       - key: nvidia.com/gpu
         operator: Exists

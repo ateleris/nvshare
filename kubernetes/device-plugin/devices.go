@@ -35,4 +35,3 @@ func getDevices() []*pluginapi.Device {
 
 	return devs
 }
-

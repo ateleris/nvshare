@@ -29,7 +29,7 @@ spec:
       priorityClassName: system-node-critical
       containers:
       - name: nvshare-lib
-        image: ghcr.io/ateleris/nvshare:libnvshare-latest
+        image: ghcr.io/ateleris/nvshare:libnvshare-v1.1.0
         command:
         - sleep
         - infinity
@@ -58,7 +58,7 @@ spec:
           # mount for /var/run/nvshare/libnvshare.so
           mountPropagation: Bidirectional
       - name: nvshare-device-plugin
-        image: ghcr.io/ateleris/nvshare:device-plugin-latest
+        image: ghcr.io/ateleris/nvshare:device-plugin-v1.1.0
         imagePullPolicy: IfNotPresent
         env:
         - name: NVSHARE_VIRTUAL_DEVICES
@@ -75,13 +75,27 @@ spec:
         - containerPort: 8080
           name: metrics
           protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: metrics
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: metrics
+          initialDelaySeconds: 10
+          periodSeconds: 20
         volumeMounts:
           - name: device-plugin-socket
             mountPath: /var/lib/kubelet/device-plugins
           - name: host-var-run-nvshare
             mountPath: /var/run/nvshare
         resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
           limits:
+            memory: 128Mi
             nvidia.com/gpu: 1
       volumes:
         - name: host-var-run-nvshare
