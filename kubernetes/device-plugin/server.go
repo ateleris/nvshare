@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"path"
 	"path/filepath"
 	"time"
@@ -26,7 +27,6 @@ import (
 	"net"
 	"os"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
@@ -37,6 +37,8 @@ const (
 )
 
 type NvshareDevicePlugin struct {
+	pluginapi.UnimplementedDevicePluginServer
+
 	devs   []*pluginapi.Device
 	socket string
 
@@ -220,7 +222,7 @@ func (m *NvshareDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Allo
 	log.SetOutput(os.Stderr)
 	responses := pluginapi.AllocateResponse{}
 	for _, req := range reqs.ContainerRequests {
-		for _, id := range req.DevicesIDs {
+		for _, id := range req.DevicesIds {
 			log.Printf("Received Allocate request for %s", id)
 			if !m.deviceExists(id) {
 				return nil, fmt.Errorf("invalid allocation request for '%s' - unknown device: %s", resourceName, id)
