@@ -19,7 +19,7 @@ GENERAL_LDFLAGS = -Wl,-z,defs -Wl,-z,relro -Wl,-z,now -Wl,--no-undefined
 LIBNVSHARE_LDFLAGS = -shared -Wl,-soname=libnvshare.so -Wl,--version-script=libnvshare-symbols.ld -Wl,--exclude-libs,ALL
 LIBNVSHARE_LDLIBS = -ldl -lpthread
 SCHEDULER_LDLIBS = -lpthread
-CFLAGS = -O3 -Wall -Wextra -std=gnu99 -fPIC -D_FORTIFY_SOURCE=2
+CFLAGS = -O3 -Wall -Wextra -std=gnu99 -fPIC -D_FORTIFY_SOURCE=2 $(EXTRA_CFLAGS)
 
 # Target rules
 all: libnvshare.so nvshare-scheduler nvsharectl tarball

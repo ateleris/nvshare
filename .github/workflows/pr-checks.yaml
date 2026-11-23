@@ -1,0 +1,69 @@
+name: PR checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  c:
+    name: C build
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Install build tools
+        run: apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev make
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build with warnings as errors
+        run: make -C src EXTRA_CFLAGS=-Werror libnvshare.so nvshare-scheduler nvsharectl
+
+      - name: Check metrics wire format against golden file
+        run: |
+          gcc -Isrc kubernetes/device-plugin/testdata/gen_wire_golden.c src/common.o -o gen_wire_golden
+          ./gen_wire_golden | cmp - kubernetes/device-plugin/testdata/wire_golden.bin
+
+  go:
+    name: Go build and test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kubernetes/device-plugin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache-dependency-path: kubernetes/device-plugin/go.sum
+
+      - name: Check go.mod is tidy
+        run: go mod tidy -diff
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  images:
+    name: Build ${{ matrix.component }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [device_plugin, libnvshare, scheduler]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build Docker image
+        run: docker build -f Dockerfile.${{ matrix.component }} .

@@ -1030,7 +1030,8 @@ CUresult cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
 	return result;
 }
 
-CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream) 
+CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize,
+	CUstream hStream __attribute__((unused)))
 {
 	log_debug("cuMemAllocAsync requested");
 	static int got_max_mem_size = 0;
@@ -1069,7 +1070,8 @@ CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream)
 	return result;
 }
 
-CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) 
+CUresult cuMemFreeAsync(CUdeviceptr dptr,
+	CUstream hStream __attribute__((unused)))
 {
 	log_debug("cuMemFreeAsync requested");
 	CUresult result = CUDA_SUCCESS;
