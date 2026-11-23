@@ -1,0 +1,8 @@
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 as build
+COPY tests/gpu-test.cu /gpu-test.cu
+RUN nvcc -O2 -o /gpu-test /gpu-test.cu
+
+
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04
+COPY --from=build /gpu-test /usr/local/bin/gpu-test
+ENTRYPOINT ["gpu-test"]

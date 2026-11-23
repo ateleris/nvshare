@@ -26,6 +26,15 @@ jobs:
           gcc -Isrc kubernetes/device-plugin/testdata/gen_wire_golden.c src/common.o -o gen_wire_golden
           ./gen_wire_golden | cmp - kubernetes/device-plugin/testdata/wire_golden.bin
 
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvshare-binaries
+          path: |
+            src/libnvshare.so
+            src/nvshare-scheduler
+            src/nvsharectl
+
   go:
     name: Go build and test
     runs-on: ubuntu-latest
@@ -55,15 +64,60 @@ jobs:
         run: go test -race ./...
 
   images:
-    name: Build ${{ matrix.component }} image
+    name: Build ${{ matrix.dockerfile }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        component: [device_plugin, libnvshare, scheduler]
+        dockerfile:
+          - Dockerfile.device_plugin
+          - Dockerfile.libnvshare
+          - Dockerfile.scheduler
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
       - name: Build Docker image
-        run: docker build -f Dockerfile.${{ matrix.component }} .
+        run: docker build -f ${{ matrix.dockerfile }} .
+
+  gpu-test-image:
+    name: Build tests/dockerfiles/Dockerfile.gputest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build Docker image
+        run: docker build -f tests/dockerfiles/Dockerfile.gputest -t gpu-test .
+
+      - name: Extract test binary
+        run: |
+          docker create --name gpu-test gpu-test
+          docker cp gpu-test:/usr/local/bin/gpu-test gpu-test
+
+      - name: Upload test binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpu-test
+          path: gpu-test
+
+  gpu:
+    name: GPU sharing test
+    needs: [c, gpu-test-image]
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: bin
+          merge-multiple: true
+
+      - name: Run two workloads on one GPU
+        run: |
+          chmod +x bin/nvshare-scheduler bin/nvsharectl bin/gpu-test
+          tests/gpu-e2e.sh bin
