@@ -171,7 +171,7 @@ Set `NVSHARE_ENABLE_SINGLE_OVERSUB=1` for an application to allow it. Expect deg
 Pick a [release](https://github.com/ateleris/nvshare/releases) and apply its manifests:
 
 ```bash
-NVSHARE_VERSION=v1.2.0
+NVSHARE_VERSION=v1.3.0
 BASE=https://raw.githubusercontent.com/ateleris/nvshare/${NVSHARE_VERSION}/kubernetes/manifests
 
 kubectl apply \
@@ -223,7 +223,7 @@ Run the GPU test workload twice at the same time, with different pod names. Use 
 
 ```bash
 kubectl run gpu-test-1 --rm -i --restart=Never \
-  --image=ghcr.io/ateleris/nvshare:gpu-test-v1.2.0 \
+  --image=ghcr.io/ateleris/nvshare:gpu-test-v1.3.0 \
   --override-type=strategic \
   --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"gpu-test-1","resources":{"limits":{"nvshare.com/gpu":"1"}}}]}}' \
   -- --mem-mib 4096 --seconds 120
@@ -289,7 +289,7 @@ sudo install nvsharectl /usr/local/bin/
 
 ```bash
 mkdir bin && cp src/libnvshare.so src/nvshare-scheduler src/nvsharectl bin/
-id=$(docker create ghcr.io/ateleris/nvshare:gpu-test-v1.2.0)
+id=$(docker create ghcr.io/ateleris/nvshare:gpu-test-v1.3.0)
 docker cp "$id":/usr/local/bin/gpu-test bin/ && docker rm "$id"
 sudo tests/gpu-e2e.sh bin
 ```
