@@ -26,7 +26,7 @@ enum metrics_message_type {
 };
 
 enum metrics_release_reason {
-	METRICS_RELEASE_QUANTUM = 0, /* after DROP_LOCK: time quantum expired */
+	METRICS_RELEASE_QUANTUM = 0, /* after DROP_LOCK: quantum expired, others waiting */
 	METRICS_RELEASE_IDLE = 1,    /* client released on its own */
 	METRICS_RELEASE_EXIT = 2,    /* client disconnected while holding */
 	METRICS_RELEASE_OFF = 3,     /* scheduler turned off or stopped */

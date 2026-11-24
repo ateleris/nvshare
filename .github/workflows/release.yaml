@@ -85,6 +85,7 @@ jobs:
 
   notes:
     name: Add requirements to the release notes
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -108,7 +109,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$TAG" --json body --jq .body > notes.md
-          if grep -q '^## Requirements' notes.md; then
+          if grep -Eiq '^#{1,6} .*requirements' notes.md; then
             echo "the release notes already have a requirements section"
             exit 0
           fi
