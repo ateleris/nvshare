@@ -67,6 +67,8 @@ cuGetProcAddress_v2_func real_cuGetProcAddress_v2 = NULL;
 cuMemAllocManaged_func real_cuMemAllocManaged = NULL;
 cuMemFree_func real_cuMemFree = NULL;
 cuMemGetInfo_func real_cuMemGetInfo = NULL;
+cuDeviceGet_func real_cuDeviceGet = NULL;
+cuDeviceTotalMem_func real_cuDeviceTotalMem = NULL;
 cuGetErrorString_func real_cuGetErrorString = NULL;
 cuGetErrorName_func real_cuGetErrorName = NULL;
 cuCtxSetCurrent_func real_cuCtxSetCurrent = NULL;
@@ -194,6 +196,16 @@ static void bootstrap_cuda(void)
 	error = dlerror();
 	if (error != NULL)
 		log_fatal("%s", error);
+	real_cuDeviceGet = (cuDeviceGet_func)
+		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuDeviceGet));
+	error = dlerror();
+	if (error != NULL)
+		log_debug("%s", error);
+	real_cuDeviceTotalMem = (cuDeviceTotalMem_func)
+		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuDeviceTotalMem));
+	error = dlerror();
+	if (error != NULL)
+		log_debug("%s", error);
 	real_cuGetErrorString = (cuGetErrorString_func)
 		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuGetErrorString));
 	error = dlerror();
@@ -298,6 +310,8 @@ static void insert_cuda_allocation(CUdeviceptr dptr, size_t bytesize)
 	allocation->size = bytesize;
 	allocation->next = NULL;
 	LL_APPEND(cuda_allocation_list, allocation);
+
+	report_mem_growth();
 }
 
 /* Remove a CUDA memory allocation given the pointer it starts at */

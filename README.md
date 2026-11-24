@@ -34,6 +34,7 @@ NVIDIA's device plugin assigns GPUs to containers one-to-one. That wastes the GP
 - Every process has the whole GPU memory available.
   - Unified Memory swaps GPU memory to system RAM.
   - The scheduler serializes overlapping GPU work to avoid thrashing, and applications release the GPU early when they are idle.
+  - Applications whose memory fits on the GPU together use it in parallel.
 - Device plugin for Kubernetes.
 - Prometheus metrics for the GPU time of every pod.
 
@@ -45,12 +46,13 @@ NVIDIA's device plugin assigns GPUs to containers one-to-one. That wastes the GP
 2. Replacing every `cudaMalloc()` call with `cudaMallocManaged()`, that is, transparently forcing the use of CUDA's Unified Memory API, does not affect correctness and costs about 1% in performance.
 3. With (2), constraint (1) no longer holds for an application written with `cudaMalloc()`.
 4. When GPU memory is oversubscribed (`Σ(mem_allocs) > GPU_mem_size`), the working sets of the co-located applications, the data they are *actively* using, may not fit in GPU memory (`Σ(wss) > GPU_mem_size`). NVIDIA's own scheduler switches between applications every few milliseconds, which then causes thrashing. `nvshare-scheduler` serializes GPU work to prevent this.
-5. If `Σ(wss) <= GPU_mem_size`, the anti-thrashing mode of the scheduler can be turned off.
+5. While `Σ(mem_allocs)` still fits in GPU memory, thrashing cannot happen. The scheduler detects this and lets the applications use the GPU in parallel.
+6. If `Σ(wss) <= GPU_mem_size` although `Σ(mem_allocs)` does not fit, the anti-thrashing mode of the scheduler can be turned off by hand.
 
 ### Components
 
-- **`libnvshare.so`** is injected into CUDA applications through `LD_PRELOAD`. It turns normal memory allocations into Unified Memory allocations and asks the scheduler for the GPU whenever the application wants to compute on it.
-- **`nvshare-scheduler`** manages one GPU. It hands the GPU lock to one client at a time, first come first served. A client keeps the lock for at most TQ seconds while others wait for it.
+- **`libnvshare.so`** is injected into CUDA applications through `LD_PRELOAD`. It turns normal memory allocations into Unified Memory allocations, tells the scheduler how much memory the application has allocated, and asks it for the GPU whenever the application wants to compute on it.
+- **`nvshare-scheduler`** manages one GPU. While the memory of all clients fits on the GPU together, it gives the GPU lock to every client that asks. Otherwise it hands the lock to one client at a time, first come first served, and a client keeps it for at most TQ seconds while others wait for it.
 - **`nvsharectl`** is a command-line tool to configure a running scheduler.
 - **`nvshare-device-plugin`** (Kubernetes only) takes one `nvidia.com/gpu` from NVIDIA's device plugin, offers it as several `nvshare.com/gpu` devices, injects `libnvshare.so` into the pods that request one, and serves the metrics.
 
@@ -103,11 +105,34 @@ sequenceDiagram
     B->>S: LOCK_RELEASED
 ```
 
-If the combined GPU memory usage of the co-located applications fits in GPU memory, they can run in parallel without problems. When it does not, the scheduler must serialize their GPU work to avoid thrashing. This anti-thrashing mode is on by default. There is no automatic detection of thrashing, so you turn it on and off yourself with `nvsharectl`.
+#### Parallel use while the memory fits
+
+Applications can only thrash when their memory does not fit on the GPU together. The scheduler adds up the GPU memory that all connected applications have allocated, plus 1.5 GiB each for their CUDA context, and compares it with the size of the GPU memory:
+
+- While the sum fits, every application that asks for the lock gets it at once, and they compute at the same time. Nobody waits, and the TQ has no effect.
+- When the sum no longer fits, the scheduler asks all lock holders but one to give the lock back, and the applications take turns as described above. They go back to parallel use as soon as the memory fits again, for example when one of them exits.
+
+What counts:
+
+- Allocated memory, not the memory an application is actively using, so the scheduler errs on the side of taking turns. A framework that reserves most of the GPU memory at startup, as TensorFlow does by default, never fits next to another application.
+- Every connected application, including the ones that are idle at the moment.
+- Memory allocated with `cudaMalloc()`. Memory that an application allocates as Unified Memory itself is not counted.
+- Only applications that use `nvshare`. The scheduler does not see memory that other processes use on the same GPU.
+- Growth at once, and freed memory once the application has been idle for a few seconds.
+
+An application that runs with an older `libnvshare` does not report its memory. While one is connected, all applications take turns.
+
+The scheduler trusts what the applications report. An application that reports less memory than it has can make the others thrash, just as any application that reaches the scheduler socket can turn the anti-thrashing mode off. Where the applications on a GPU do not trust each other, turn parallel use off.
+
+Parallel use is on by default. Turn it off with `NVSHARE_PARALLEL=0` on the scheduler or with `nvsharectl -P off`, and the applications always take turns.
+
+#### Anti-thrashing mode
+
+Taking turns is what prevents thrashing when the memory does not fit. This anti-thrashing mode is on by default. If the working sets of the applications fit in GPU memory although their allocations do not, you can turn it off with `nvsharectl -S off`. All applications then use the GPU freely. There is no automatic detection of thrashing, so this is your call.
 
 #### Choosing the time quantum
 
-> The TQ only has an effect while the anti-thrashing mode is on.
+> The TQ only has an effect while applications take turns.
 
 A larger TQ favors throughput, a smaller one favors responsiveness.
 
@@ -204,7 +229,9 @@ kubectl run gpu-test-1 --rm -i --restart=Never \
   -- --mem-mib 4096 --seconds 120
 ```
 
-Each run prints `libnvshare loaded: yes`, how long it waited for the GPU, and `PASS` at the end. The logs of the `nvshare-scheduler` pod on that node show the `REQ_LOCK`, `LOCK_OK` and `DROP_LOCK` messages as the two pods take turns.
+Each run prints `libnvshare loaded: yes`, how long it waited for the GPU, and `PASS` at the end.
+
+Two runs of 4096 MiB fit on most GPUs together, so they run in parallel and neither waits. To see them take turns, give each more than half of the GPU memory with `--mem-mib`, or turn parallel use off with `nvsharectl -P off`. The logs of the `nvshare-scheduler` pod on that node then show the `REQ_LOCK`, `LOCK_OK` and `DROP_LOCK` messages as the two pods take turns.
 
 ### Uninstall
 
@@ -258,7 +285,7 @@ sudo install nvsharectl /usr/local/bin/
 
 ### Test
 
-`tests/gpu-e2e.sh` starts a scheduler, runs two GPU workloads against it and checks that they shared the GPU. It is the test CI runs on a real GPU. It needs the three binaries and the `gpu-test` workload in one directory:
+`tests/gpu-e2e.sh` starts a scheduler and runs two GPU workloads against it, twice: first they must hold the lock at the same time, then, with parallel use turned off, they must take turns. It is the test CI runs on a real GPU. It needs the three binaries and the `gpu-test` workload in one directory:
 
 ```bash
 mkdir bin && cp src/libnvshare.so src/nvshare-scheduler src/nvsharectl bin/
@@ -277,6 +304,7 @@ To see what the anti-thrashing mode does, run more workloads than fit in GPU mem
 |---|---|
 | `-T`, `--set-tq=n` | Set the time quantum to `n` seconds. The quantum of the application that holds the GPU starts over. |
 | `-S`, `--anti-thrash=on\|off` | Turn the anti-thrashing mode on or off. When it is off, all applications use the GPU freely. |
+| `-P`, `--parallel=on\|off` | Turn parallel use on or off. When it is off, applications take turns even if their memory fits on the GPU together. |
 
 Environment variables of an application that uses `nvshare`:
 
@@ -292,6 +320,7 @@ Environment variables of the scheduler and the device plugin:
 |---|---|---|
 | `NVSHARE_DEBUG=1` | scheduler | Print debug logs. |
 | `NVSHARE_TQ` | scheduler | Time quantum in seconds at startup, 30 by default. `nvsharectl -T` changes it until the next restart. |
+| `NVSHARE_PARALLEL=0` | scheduler | Start with parallel use turned off. `nvsharectl -P` changes it until the next restart. |
 | `NVSHARE_VIRTUAL_DEVICES` | device plugin | Number of `nvshare.com/gpu` devices to offer per GPU. Required, 10 in the provided manifest. |
 | `NVSHARE_METRICS_PORT` | device plugin | Port of the metrics endpoint, 8080 by default. |
 

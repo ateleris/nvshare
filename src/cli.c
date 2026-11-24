@@ -33,6 +33,7 @@ static char nvscheduler_socket_path[NVSHARE_SOCK_PATH_MAX];
 typedef struct {
 	int cmdline_scheduler_tq;
 	const char *cmdline_anti_thrash;
+	const char *cmdline_parallel;
 	bool help;
 } SimpleConfig;
 
@@ -57,6 +58,17 @@ xoptOption options[] = {
 		"s",
 		"Set the desired status of the scheduler. Only accepts values"
 		" \"on\" or \"off\"."
+	},
+	{
+		"parallel",
+		'P',
+		offsetof(SimpleConfig, cmdline_parallel),
+		0,
+		XOPT_TYPE_STRING,
+		"s",
+		"Let applications use the GPU at the same time while their GPU"
+		" memory fits on it together. Only accepts values \"on\" or"
+		" \"off\"."
 	},
 	{
 		"help",
@@ -114,6 +126,26 @@ static int change_status(int status)
 }
 
 
+static int change_parallel(int parallel)
+{
+	int rsock;
+	int ret;
+	struct message msg = {0};
+
+	msg.id = 0xBEEF;
+	msg.type = SET_PARALLEL;
+	msg.data[0] = parallel ? '1' : '0';
+
+	ret = 0;
+	true_or_exit(nvshare_connect(&rsock, nvscheduler_socket_path) == 0);
+	if (write_whole(rsock, &msg, sizeof(msg)) != sizeof(msg))
+		ret = -1;
+	true_or_exit(close(rsock) == 0);
+
+	return ret;
+}
+
+
 int main(int argc, const char *argv[])
 {
 	int status;
@@ -125,6 +157,7 @@ int main(int argc, const char *argv[])
 
 	config.cmdline_scheduler_tq = 0;
 	config.cmdline_anti_thrash = NULL;
+	config.cmdline_parallel = NULL;
 
 	ctx = xopt_context("nvsharectl", options,
 			XOPT_CTX_POSIXMEHARDER | XOPT_CTX_STRICT, &opt_err);
@@ -154,6 +187,22 @@ int main(int argc, const char *argv[])
 				   config.cmdline_anti_thrash);
 		else log_info("Successfully turned the nvshare-scheduler %s.",
 				config.cmdline_anti_thrash);
+		actions_done++;
+	}
+
+	if (config.cmdline_parallel != NULL) {
+		if (strcmp(config.cmdline_parallel, "on") == 0)
+			status = 1;
+		else if (strcmp(config.cmdline_parallel, "off") == 0)
+			status = 0;
+		else log_fatal("Invalid option for --parallel (-P). Must"
+			       " be one of 'on' or 'off'.");
+
+		if (change_parallel(status) != 0)
+			log_info("Failed to turn parallel GPU use %s.",
+				   config.cmdline_parallel);
+		else log_info("Successfully turned parallel GPU use %s.",
+				config.cmdline_parallel);
 		actions_done++;
 	}
 

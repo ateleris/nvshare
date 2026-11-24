@@ -65,6 +65,8 @@ enum message_type {
 	DROP_LOCK      = 6,
 	LOCK_RELEASED  = 7,
 	SET_TQ         = 8,
+	MEM_USAGE      = 9,
+	SET_PARALLEL   = 10,
 } __attribute__((__packed__));
 
 struct message {

@@ -37,6 +37,8 @@ struct metrics_client {
 	struct metrics_pod *pod;
 	enum client_state state;
 	int drop_sent;
+	enum metrics_release_reason drop_reason;
+	uint64_t mem_mib;
 	struct timespec since;
 	struct metrics_client *next;
 };
@@ -50,6 +52,7 @@ static struct metrics_pod *pods = NULL;
 static struct metrics_client *tracked = NULL;
 static int sched_on;
 static int sched_tq;
+static int sched_parallel;
 static uint64_t dropped_messages;
 
 static int try_connect_socket(void)
@@ -186,6 +189,7 @@ static void publish_pod(const struct metrics_pod *pod, const struct timespec *no
 	LL_FOREACH(tracked, c) {
 		if (c->pod != pod)
 			continue;
+		msg.mem_mib += c->mem_mib;
 		if (c->state == CLIENT_HOLDING) {
 			msg.holding = 1;
 			msg.held_ms += elapsed_ms(&c->since, now);
@@ -209,6 +213,7 @@ static void publish_sched(void)
 	msg.scheduler_on = sched_on ? 1 : 0;
 	msg.tq_sec = (uint32_t)sched_tq;
 	msg.dropped_messages = dropped_messages;
+	msg.parallel = sched_parallel ? 1 : 0;
 
 	LL_FOREACH(tracked, c) {
 		msg.clients++;
@@ -239,10 +244,11 @@ static void leave_state(struct metrics_client *c, const struct timespec *now,
 	c->drop_sent = 0;
 }
 
-void metrics_init(int scheduler_on, int tq)
+void metrics_init(int scheduler_on, int tq, int parallel)
 {
 	sched_on = scheduler_on;
 	sched_tq = tq;
+	sched_parallel = parallel;
 	if (try_connect_socket() < 0)
 		log_info("METRICS: Device plugin socket not yet available; will keep retrying");
 }
@@ -327,12 +333,27 @@ void metrics_lock_acquired(const struct nvshare_client *client)
 	publish_client(c, &now);
 }
 
-void metrics_drop_sent(const struct nvshare_client *client)
+void metrics_client_memory(const struct nvshare_client *client)
+{
+	struct metrics_client *c = find_client(client->id);
+	struct timespec now = now_ts();
+
+	if (c == NULL || c->mem_mib == client->mem_mib)
+		return;
+
+	c->mem_mib = client->mem_mib;
+	publish_pod(c->pod, &now);
+}
+
+void metrics_drop_sent(const struct nvshare_client *client,
+		       enum metrics_release_reason reason)
 {
 	struct metrics_client *c = find_client(client->id);
 
-	if (c != NULL && c->state == CLIENT_HOLDING)
+	if (c != NULL && c->state == CLIENT_HOLDING) {
 		c->drop_sent = 1;
+		c->drop_reason = reason;
+	}
 }
 
 void metrics_lock_released(const struct nvshare_client *client)
@@ -343,7 +364,7 @@ void metrics_lock_released(const struct nvshare_client *client)
 	if (c == NULL || c->state == CLIENT_IDLE)
 		return;
 
-	leave_state(c, &now, c->drop_sent ? METRICS_RELEASE_QUANTUM : METRICS_RELEASE_IDLE);
+	leave_state(c, &now, c->drop_sent ? c->drop_reason : METRICS_RELEASE_IDLE);
 	publish_client(c, &now);
 }
 
@@ -351,7 +372,7 @@ void metrics_lock_released(const struct nvshare_client *client)
  * When the scheduler is turned off every client runs freely and the
  * requests list is discarded, so close all holds and waits.
  */
-void metrics_scheduler_state(int scheduler_on, int tq)
+void metrics_scheduler_state(int scheduler_on, int tq, int parallel)
 {
 	struct metrics_client *c;
 	struct metrics_pod *pod;
@@ -366,6 +387,7 @@ void metrics_scheduler_state(int scheduler_on, int tq)
 
 	sched_on = scheduler_on;
 	sched_tq = tq;
+	sched_parallel = parallel;
 	publish_sched();
 }
 

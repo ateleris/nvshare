@@ -48,6 +48,8 @@ const char *message_type_string[] = {
 	[DROP_LOCK] = "DROP_LOCK",
 	[SET_TQ] = "SET_TQ",
 	[REGISTER] = "REGISTER",
+	[MEM_USAGE] = "MEM_USAGE",
+	[SET_PARALLEL] = "SET_PARALLEL",
 };
 
 

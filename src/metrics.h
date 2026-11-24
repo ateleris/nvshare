@@ -12,7 +12,7 @@
  * a scheduler and a device plugin of different versions lose metrics but
  * never misinterpret them. Deploy both together.
  */
-#define METRICS_PROTOCOL_VERSION 2u
+#define METRICS_PROTOCOL_VERSION 3u
 
 /* How often the scheduler re-sends the state of every pod. */
 #define METRICS_TICK_SEC 10
@@ -30,7 +30,8 @@ enum metrics_release_reason {
 	METRICS_RELEASE_IDLE = 1,    /* client released on its own */
 	METRICS_RELEASE_EXIT = 2,    /* client disconnected while holding */
 	METRICS_RELEASE_OFF = 3,     /* scheduler turned off or stopped */
-	METRICS_RELEASE_REASONS = 4,
+	METRICS_RELEASE_MEMORY = 4,  /* after DROP_LOCK: parallel GPU use ended */
+	METRICS_RELEASE_REASONS = 5,
 };
 
 /*
@@ -54,6 +55,7 @@ struct metrics_pod_stats {
 	uint64_t wait_ms;  /* includes waits in progress */
 	uint64_t acquisitions;
 	uint64_t releases[METRICS_RELEASE_REASONS];
+	uint64_t mem_mib;  /* GPU memory its clients reported as allocated */
 } __attribute__((__packed__));
 
 struct metrics_sched_stats {
@@ -64,10 +66,11 @@ struct metrics_sched_stats {
 	uint32_t clients;
 	uint32_t queue_length;      /* clients waiting for the lock */
 	uint64_t dropped_messages;  /* metrics datagrams that could not be sent */
+	uint32_t parallel;          /* 1 if all clients may hold the lock at once */
 } __attribute__((__packed__));
 
-_Static_assert(sizeof(struct metrics_pod_stats) == 584, "pod stats wire size");
-_Static_assert(sizeof(struct metrics_sched_stats) == 32, "sched stats wire size");
+_Static_assert(sizeof(struct metrics_pod_stats) == 600, "pod stats wire size");
+_Static_assert(sizeof(struct metrics_sched_stats) == 36, "sched stats wire size");
 
 /*
  * Locking contract: all metrics_* functions must be called with the
@@ -75,14 +78,16 @@ _Static_assert(sizeof(struct metrics_sched_stats) == 32, "sched stats wire size"
  * mutex -- its state is only ever touched from paths the scheduler has
  * already serialized.
  */
-void metrics_init(int scheduler_on, int tq);
+void metrics_init(int scheduler_on, int tq, int parallel);
 void metrics_client_registered(const struct nvshare_client *client);
 void metrics_client_removed(const struct nvshare_client *client);
 void metrics_lock_requested(const struct nvshare_client *client);
 void metrics_lock_acquired(const struct nvshare_client *client);
-void metrics_drop_sent(const struct nvshare_client *client);
+void metrics_client_memory(const struct nvshare_client *client);
+void metrics_drop_sent(const struct nvshare_client *client,
+		       enum metrics_release_reason reason);
 void metrics_lock_released(const struct nvshare_client *client);
-void metrics_scheduler_state(int scheduler_on, int tq);
+void metrics_scheduler_state(int scheduler_on, int tq, int parallel);
 void metrics_tick(void);
 void metrics_cleanup(void);
 
