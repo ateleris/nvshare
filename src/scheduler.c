@@ -65,6 +65,7 @@ int metrics_fd;
 
 
 struct nvshare_client *clients = NULL;
+struct nvshare_client *dead_clients = NULL;
 struct nvshare_request *requests = NULL;
 
 void *timer_thr_fn(void *arg __attribute__((unused)));
@@ -93,11 +94,15 @@ static void client_id_as_string(char *buf, size_t buflen, uint64_t id)
 	else snprintf(buf, buflen, "%016" PRIx64, id);
 }
 
+/*
+ * The main loop may still hold an epoll event that points to this client, so
+ * the struct is only marked dead here. free_dead_clients() frees it once the
+ * main loop is done with its current batch of events.
+ */
 static void delete_client(struct nvshare_client *client)
 {
 	int cfd = client->fd;
 	char id_str[HEX_STR_LEN(client->id)];
-	struct nvshare_client *tmp, *c;
 
 
 	client_id_as_string(id_str, sizeof(id_str), client->id);
@@ -106,18 +111,25 @@ static void delete_client(struct nvshare_client *client)
 
 	metrics_client_removed(client);
 
-	/* Remove from clients list */
-	LL_FOREACH_SAFE(clients, c, tmp) {
-		if (c->fd == cfd) {
-			LL_DELETE(clients, c);
-			free(c);
-		}
-	}
+	LL_DELETE(clients, client);
 
 	true_or_exit(epoll_ctl(epoll_fd, EPOLL_CTL_DEL, cfd, NULL) == 0);
 	/* See man close(2) for EINTR behavior on Linux */
 	if (close(cfd) < 0 && errno != EINTR)
 		log_fatal_errno("Failed to close FD %d", cfd);
+
+	client->fd = -1;
+	LL_PREPEND(dead_clients, client);
+}
+
+static void free_dead_clients(void)
+{
+	struct nvshare_client *tmp, *c;
+
+	LL_FOREACH_SAFE(dead_clients, c, tmp) {
+		LL_DELETE(dead_clients, c);
+		free(c);
+	}
 }
 
 static void insert_req(struct nvshare_client *client)
@@ -722,7 +734,10 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 
 			} else { /* Some event other than new connection */
 				client = (struct nvshare_client *)events[i].data.ptr;
-				
+
+				/* Deleted since epoll reported this event */
+				if (client->fd < 0) continue;
+
 				/* Check for incoming messages */
 				if (events[i].events & EPOLLIN) {
 					ret = receive_message(client, &in_msg);
@@ -746,6 +761,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 
 			}
 		}
+		free_dead_clients();
 		true_or_exit(pthread_mutex_unlock(&global_mutex) == 0);
 	}
 
