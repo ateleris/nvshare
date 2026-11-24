@@ -205,7 +205,7 @@ int nvshare_accept(int lsock, int *rsock)
 /* Send a message on a non-blocking socket. */
 ssize_t nvshare_send_noblock(int rsock, const void *msg_p, size_t count)
 {
-	return RETRY_INTR(write(rsock, msg_p, count));
+	return RETRY_INTR(send(rsock, msg_p, count, MSG_NOSIGNAL));
 }
 
 
