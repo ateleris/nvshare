@@ -195,6 +195,25 @@ expect_eq "$(pod lock_held_seconds_total team-a pod-a)" "$held_a"
 expect_eq "$(pod lock_wait_seconds_total team-b pod-b)" "$wait_b"
 expect_eq "$(pod lock_releases_total team-c pod-c exit)" 1
 
+echo "== the scheduler survives a waiting client that dies just before it is given the lock"
+"$WORK/fake-client" team-f pod-f 1 &
+F=$!
+sleep 0.3
+"$WORK/fake-client" team-g pod-g 1 &
+G=$!
+sleep 0.3
+kill -STOP "$SCHED_PID"
+wait "$F"
+kill -KILL "$G"
+wait "$G" 2> /dev/null || true
+kill -CONT "$SCHED_PID"
+sleep 0.5
+kill -0 "$SCHED_PID"
+scrape
+expect_eq "$(pod clients team-g pod-g)" 0
+expect_eq "$(sched clients)" 0
+expect_eq "$(sched lock_queue_length)" 0
+
 echo "== the scheduler stops cleanly and the sanitizers found nothing"
 kill "$SCHED_PID"
 wait "$SCHED_PID"
