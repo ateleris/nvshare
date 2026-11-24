@@ -99,11 +99,6 @@ static void client_id_as_string(char *buf, size_t buflen, uint64_t id)
 	else snprintf(buf, buflen, "%016" PRIx64, id);
 }
 
-/*
- * The main loop may still hold an epoll event that points to this client, so
- * the struct is only marked dead here. free_dead_clients() frees it once the
- * main loop is done with its current batch of events.
- */
 static void delete_client(struct nvshare_client *client)
 {
 	int cfd = client->fd;
@@ -346,11 +341,6 @@ try_again:
 }
 
 
-/*
- * Ask the client that holds the GPU lock to give it back.
- *
- * Strict handling of clients. If something goes wrong, clean them up.
- */
 static void preempt_holder(void)
 {
 	out_msg.type = DROP_LOCK;
@@ -370,7 +360,7 @@ static int parse_tq(const char *str, int *newtq)
 	long long val;
 
 	errno = 0;
-	val = strtoll(str, &endptr, 0);
+	val = strtoll(str, &endptr, 10);
 	if (str == endptr || *endptr != '\0' || errno != 0 ||
 	    val <= 0 || val > INT_MAX)
 		return -1;
@@ -400,7 +390,7 @@ void *timer_thr_fn(void *arg __attribute__((unused)))
 	while (1) {
 		must_reset_timer = 0;
 		round_at_start = scheduling_round;
-		true_or_exit(clock_gettime(CLOCK_REALTIME, &timer_end_ts) == 0);
+		true_or_exit(clock_gettime(CLOCK_MONOTONIC, &timer_end_ts) == 0);
 		timer_end_ts.tv_sec += tq;
 remainder:
 		ret = pthread_cond_timedwait(&timer_cv, &global_mutex, &timer_end_ts);
@@ -561,6 +551,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	struct nvshare_client *client;
 	int ret, err, lsock, rsock, num_fds;
 	char *debug_val, *tq_val;
+	pthread_condattr_t timer_cv_attr;
 	struct message in_msg = {0};
 	struct epoll_event event, events[EPOLL_MAX_EVENTS];
 
@@ -605,7 +596,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	scheduler_on = 1;
 	tq = NVSHARE_DEFAULT_TQ;
 	tq_val = getenv(ENV_NVSHARE_TQ);
-	if (tq_val != NULL && parse_tq(tq_val, &tq) != 0)
+	if (tq_val != NULL && *tq_val != '\0' && parse_tq(tq_val, &tq) != 0)
 		log_fatal("%s must be a positive number of seconds, got '%s'",
 			  ENV_NVSHARE_TQ, tq_val);
 	log_info("TQ = %d", tq);
@@ -614,7 +605,9 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	srand((unsigned int)(time(NULL)));
 
 	true_or_exit(pthread_mutex_init(&global_mutex, NULL) == 0);
-	true_or_exit(pthread_cond_init(&timer_cv, NULL) == 0);
+	true_or_exit(pthread_condattr_init(&timer_cv_attr) == 0);
+	true_or_exit(pthread_condattr_setclock(&timer_cv_attr, CLOCK_MONOTONIC) == 0);
+	true_or_exit(pthread_cond_init(&timer_cv, &timer_cv_attr) == 0);
 
 	metrics_init(scheduler_on, tq);
 
@@ -759,7 +752,6 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 			} else { /* Some event other than new connection */
 				client = (struct nvshare_client *)events[i].data.ptr;
 
-				/* Deleted since epoll reported this event */
 				if (client->fd < 0) continue;
 
 				/* Check for incoming messages */

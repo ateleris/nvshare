@@ -146,7 +146,7 @@ func newMetricsCollector(port int, node, gpuUUID string, now func() time.Time) *
 			podLabels, nil),
 		lockReleases: prometheus.NewDesc(
 			"nvshare_pod_gpu_lock_releases_total",
-			"Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired), idle (released on its own), exit (process went away), off (scheduler turned off or stopped).",
+			"Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired while another process was waiting), idle (released on its own), exit (process went away), off (scheduler turned off or stopped).",
 			append(podLabels, "reason"), nil),
 		lockHolding: prometheus.NewDesc(
 			"nvshare_pod_gpu_lock_holding",
@@ -167,7 +167,7 @@ func newMetricsCollector(port int, node, gpuUUID string, now func() time.Time) *
 			nodeLabels, nil),
 		schedTimeQuantum: prometheus.NewDesc(
 			"nvshare_scheduler_time_quantum_seconds",
-			"Time quantum after which the lock holder is asked to release the GPU.",
+			"Time quantum after which the lock holder is asked to release the GPU if another process is waiting for it.",
 			nodeLabels, nil),
 		schedClients: prometheus.NewDesc(
 			"nvshare_scheduler_clients",

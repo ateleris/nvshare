@@ -275,7 +275,7 @@ To see what the anti-thrashing mode does, run more workloads than fit in GPU mem
 
 | Option | Effect |
 |---|---|
-| `-T`, `--set-tq=n` | Set the time quantum to `n` seconds. |
+| `-T`, `--set-tq=n` | Set the time quantum to `n` seconds. The quantum of the application that holds the GPU starts over. |
 | `-S`, `--anti-thrash=on\|off` | Turn the anti-thrashing mode on or off. When it is off, all applications use the GPU freely. |
 
 Environment variables of an application that uses `nvshare`:
