@@ -117,9 +117,12 @@ What counts:
 - Allocated memory, not the memory an application is actively using, so the scheduler errs on the side of taking turns. A framework that reserves most of the GPU memory at startup, as TensorFlow does by default, never fits next to another application.
 - Every connected application, including the ones that are idle at the moment.
 - Memory allocated with `cudaMalloc()`. Memory that an application allocates as Unified Memory itself is not counted.
+- Only applications that use `nvshare`. The scheduler does not see memory that other processes use on the same GPU.
 - Growth at once, and freed memory once the application has been idle for a few seconds.
 
 An application that runs with an older `libnvshare` does not report its memory. While one is connected, all applications take turns.
+
+The scheduler trusts what the applications report. An application that reports less memory than it has can make the others thrash, just as any application that reaches the scheduler socket can turn the anti-thrashing mode off. Where the applications on a GPU do not trust each other, turn parallel use off.
 
 Parallel use is on by default. Turn it off with `NVSHARE_PARALLEL=0` on the scheduler or with `nvsharectl -P off`, and the applications always take turns.
 
@@ -282,7 +285,7 @@ sudo install nvsharectl /usr/local/bin/
 
 ### Test
 
-`tests/gpu-e2e.sh` starts a scheduler and runs two GPU workloads against it, twice: first two that fit in GPU memory together and must run in parallel, then two that do not fit and must take turns. The second pair uses almost all of the GPU memory. It is the test CI runs on a real GPU. It needs the three binaries and the `gpu-test` workload in one directory:
+`tests/gpu-e2e.sh` starts a scheduler and runs two GPU workloads against it, twice: first they must hold the lock at the same time, then, with parallel use turned off, they must take turns. It is the test CI runs on a real GPU. It needs the three binaries and the `gpu-test` workload in one directory:
 
 ```bash
 mkdir bin && cp src/libnvshare.so src/nvshare-scheduler src/nvsharectl bin/

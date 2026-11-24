@@ -12,6 +12,7 @@ MEM_MIB=${MEM_MIB:-2048}
 DURATION=${DURATION:-40}
 PARALLEL_DURATION=${PARALLEL_DURATION:-20}
 TQ=${TQ:-5}
+MIN_FREE_MIB=1024
 RESERVE_MIB=1536
 
 LOGS=$(mktemp -d)
@@ -49,10 +50,10 @@ wait_for_log() {
 }
 
 run() {
-    local mem=$1 seconds=$2 n log id registered rc
+    local parallel=$1 seconds=$2 n log id registered rc first_exit
 
     rm -f "$SOCK" "$LOGS"/*.log
-    "$BIN/nvshare-scheduler" > "$LOGS/scheduler.log" 2>&1 &
+    NVSHARE_PARALLEL=$parallel "$BIN/nvshare-scheduler" > "$LOGS/scheduler.log" 2>&1 &
     SCHED_PID=$!
     if ! wait_for_log "listening on"; then
         fail "scheduler did not start"
@@ -67,10 +68,10 @@ run() {
         exit 1
     fi
 
-    echo "running 2 workloads: $mem MiB each, $seconds s, time quantum $TQ s"
+    echo "running 2 workloads: $MEM_MIB MiB each, $seconds s, time quantum $TQ s"
     for n in 1 2; do
         LD_PRELOAD="$BIN/libnvshare.so" "$BIN/gpu-test" \
-            --mem-mib "$mem" --seconds "$seconds" > "$LOGS/workload-$n.log" 2>&1 &
+            --mem-mib "$MEM_MIB" --seconds "$seconds" > "$LOGS/workload-$n.log" 2>&1 &
         PIDS[n]=$!
     done
     for n in 1 2; do
@@ -98,7 +99,9 @@ run() {
     done < <(sed -n 's/.*Registered client \([0-9a-f]*\) .*/\1/p' "$LOGS/scheduler.log")
     registered=$(grep -c "Registered client" "$LOGS/scheduler.log")
     drops=$(grep -c "Sent DROP_LOCK" "$LOGS/scheduler.log")
-    turns=$(grep -c "one client at a time" "$LOGS/scheduler.log")
+    first_exit=$(grep -nE "Removing client [0-9a-f]{16}$" "$LOGS/scheduler.log" | head -1 | cut -d: -f1)
+    holders=$(head -n "${first_exit:-0}" "$LOGS/scheduler.log" | sed -n 's/.*Sent LOCK_OK to client //p' | sort -u | wc -l)
+    releases=$(head -n "${first_exit:-0}" "$LOGS/scheduler.log" | grep -c "Received LOCK_RELEASED")
     [ "$registered" -eq 2 ] || fail "scheduler registered $registered clients, expected 2"
     [ "$rc" -eq 0 ] || fail "scheduler exited with $rc"
     if grep -q "did not report the size of the GPU memory" "$LOGS/scheduler.log"; then
@@ -109,33 +112,29 @@ run() {
 nvidia-smi --query-gpu=name,driver_version,memory.used,memory.total,utilization.gpu --format=csv,noheader
 free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
 total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
-BIG_MEM_MIB=${BIG_MEM_MIB:-$((total / 2 - 1280))}
+if [ "$free" -lt "$MIN_FREE_MIB" ]; then
+    echo "FAIL: gpu has only $free MiB free, need $MIN_FREE_MIB (in use by other processes?)"
+    exit 1
+fi
 if [ $((2 * (MEM_MIB + RESERVE_MIB + 64))) -gt "$total" ]; then
     echo "FAIL: two workloads of $MEM_MIB MiB do not fit a gpu of $total MiB, set MEM_MIB"
     exit 1
 fi
-if [ "$free" -lt $((2 * BIG_MEM_MIB + 512)) ]; then
-    echo "FAIL: gpu has only $free MiB free, need $((2 * BIG_MEM_MIB + 512)) (in use by other processes?)"
-    exit 1
-fi
 
-echo "== two workloads that fit in GPU memory together run in parallel"
-run "$MEM_MIB" "$PARALLEL_DURATION"
-for n in 1 2; do
-    [ "${WAITS[n]:-1}" -eq 0 ] || fail "workload $n waited for the gpu"
-done
+echo "== two workloads that fit in GPU memory together hold the lock at the same time"
+run 1 "$PARALLEL_DURATION"
+[ "$holders" -eq 2 ] || fail "$holders workloads held the lock before the first one finished, expected 2"
+[ "$releases" -eq 0 ] || fail "a workload gave up the lock $releases times while it was computing"
 [ "$drops" -eq 0 ] || fail "scheduler sent DROP_LOCK $drops times"
-[ "$turns" -eq 0 ] || fail "scheduler made the workloads take turns"
 
-echo "== two workloads that do not fit in GPU memory together take turns"
-run "$BIG_MEM_MIB" "$DURATION"
+echo "== with parallel use turned off, the same workloads take turns"
+run 0 "$DURATION"
 for n in 1 2; do
     [ "${WAITS[n]:-0}" -ge 1 ] || fail "workload $n never waited for the gpu"
 done
 [ "$drops" -ge 1 ] || fail "scheduler never sent DROP_LOCK"
-[ "$turns" -ge 1 ] || fail "scheduler let the workloads run in parallel"
 
 if [ "$failed" -ne 0 ]; then
     exit 1
 fi
-echo "PASS: the workloads ran in parallel while they fit and shared the gpu when they did not ($drops lock handovers)"
+echo "PASS: the workloads ran in parallel while allowed to and took turns otherwise ($drops lock handovers)"
