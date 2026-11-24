@@ -26,7 +26,7 @@ Release reasons:
 
 | `reason` | Meaning |
 |---|---|
-| `quantum` | The time quantum expired and the scheduler asked for the lock back. |
+| `quantum` | The time quantum expired while another process was waiting, and the scheduler asked for the lock back. |
 | `idle` | The pod released the lock on its own because it had no GPU work. |
 | `exit` | The process went away while holding the lock. |
 | `off` | The scheduler was turned off or stopped. |
