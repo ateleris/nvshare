@@ -194,7 +194,7 @@ nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="team-a",n
 # HELP nvshare_pod_gpu_lock_holding 1 if the pod currently holds the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_holding gauge
 nvshare_pod_gpu_lock_holding{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 1
-# HELP nvshare_pod_gpu_lock_releases_total Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired), idle (released on its own), exit (process went away), off (scheduler turned off or stopped).
+# HELP nvshare_pod_gpu_lock_releases_total Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired while another process was waiting), idle (released on its own), exit (process went away), off (scheduler turned off or stopped).
 # TYPE nvshare_pod_gpu_lock_releases_total counter
 nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="exit"} 0
 nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="idle"} 1
@@ -224,7 +224,7 @@ nvshare_scheduler_lock_queue_length{node="node-1"} 2
 # HELP nvshare_scheduler_metrics_dropped_total Total number of metrics messages the scheduler could not deliver.
 # TYPE nvshare_scheduler_metrics_dropped_total counter
 nvshare_scheduler_metrics_dropped_total{node="node-1"} 5
-# HELP nvshare_scheduler_time_quantum_seconds Time quantum after which the lock holder is asked to release the GPU.
+# HELP nvshare_scheduler_time_quantum_seconds Time quantum after which the lock holder is asked to release the GPU if another process is waiting for it.
 # TYPE nvshare_scheduler_time_quantum_seconds gauge
 nvshare_scheduler_time_quantum_seconds{node="node-1"} 30
 `
