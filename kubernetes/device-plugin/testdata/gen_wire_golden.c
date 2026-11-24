@@ -36,6 +36,8 @@ int main(int argc, char **argv) {
 		m.releases[METRICS_RELEASE_IDLE] = 3;
 		m.releases[METRICS_RELEASE_EXIT] = 2;
 		m.releases[METRICS_RELEASE_OFF] = 1;
+		m.releases[METRICS_RELEASE_MEMORY] = 5;
+		m.mem_mib = 4096;
 		fwrite(&m, sizeof(m), 1, stdout);
 		return 0;
 	}
@@ -49,6 +51,7 @@ int main(int argc, char **argv) {
 		m.clients = 5;
 		m.queue_length = 3;
 		m.dropped_messages = 0x0102030405060708ULL;
+		m.parallel = 1;
 		fwrite(&m, sizeof(m), 1, stdout);
 		return 0;
 	}

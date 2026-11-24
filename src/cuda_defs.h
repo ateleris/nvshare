@@ -31,6 +31,7 @@
 #define CUDA_SYMBOL_STRING(x)       STRINGIFY(x)
 
 #define cuMemGetInfo                cuMemGetInfo_v2
+#define cuDeviceTotalMem            cuDeviceTotalMem_v2
 #define cuMemAlloc                  cuMemAlloc_v2
 #define cuMemFree                   cuMemFree_v2
 #define cuMemcpyHtoD                cuMemcpyHtoD_v2
@@ -115,6 +116,8 @@ typedef CUresult (*cuMemAllocManaged_func)(CUdeviceptr *dptr, size_t bytesize,
 	unsigned int flags);
 typedef CUresult (*cuMemFree_func)(CUdeviceptr dptr);
 typedef CUresult (*cuMemGetInfo_func)(size_t *free, size_t *total);
+typedef CUresult (*cuDeviceGet_func)(CUdevice *device, int ordinal);
+typedef CUresult (*cuDeviceTotalMem_func)(size_t *bytes, CUdevice dev);
 typedef CUresult (*cuGetErrorString_func)(CUresult error, const char **pStr);
 typedef CUresult (*cuGetErrorName_func)(CUresult error, const char **pStr);
 typedef CUresult (*cuCtxSetCurrent_func)(CUcontext ctx);
@@ -194,6 +197,8 @@ extern cuGetProcAddress_v2_func real_cuGetProcAddress_v2;
 extern cuMemAllocManaged_func real_cuMemAllocManaged;
 extern cuMemFree_func real_cuMemFree;
 extern cuMemGetInfo_func real_cuMemGetInfo;
+extern cuDeviceGet_func real_cuDeviceGet;
+extern cuDeviceTotalMem_func real_cuDeviceTotalMem;
 extern cuGetErrorString_func real_cuGetErrorString;
 extern cuGetErrorName_func real_cuGetErrorName;
 extern cuCtxSetCurrent_func real_cuCtxSetCurrent;
@@ -221,6 +226,7 @@ extern nvmlDeviceGetHandleByIndex_func real_nvmlDeviceGetHandleByIndex;
 extern CUcontext cuda_ctx;
 
 extern int nvml_ok;
+extern size_t sum_allocated;
 
 #endif /* _CUDA_DEFS_H */
 

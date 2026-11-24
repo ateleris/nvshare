@@ -21,21 +21,22 @@ const (
 	metricsSocketPath = "/var/run/nvshare/metrics.sock"
 
 	// Wire protocol, kept in lockstep with src/metrics.h.
-	protocolVersion uint32 = 2
+	protocolVersion uint32 = 3
 
 	msgPodStats   uint32 = 300
 	msgSchedStats uint32 = 301
 
 	nameFieldLen   = 254
-	releaseReasons = 4
+	releaseReasons = 5
 
 	// version(4) + type(4) + ns(254) + pod(254) + clients(4) + holding(4) +
-	// waiting(4) + held_ms(8) + wait_ms(8) + acquisitions(8) + releases(4*8)
-	podStatsSize = 4 + 4 + 2*nameFieldLen + 3*4 + 3*8 + releaseReasons*8
+	// waiting(4) + held_ms(8) + wait_ms(8) + acquisitions(8) + releases(5*8) +
+	// mem_mib(8)
+	podStatsSize = 4 + 4 + 2*nameFieldLen + 3*4 + 3*8 + releaseReasons*8 + 8
 
 	// version(4) + type(4) + scheduler_on(4) + tq_sec(4) + clients(4) +
-	// queue_length(4) + dropped_messages(8)
-	schedStatsSize = 6*4 + 8
+	// queue_length(4) + dropped_messages(8) + parallel(4)
+	schedStatsSize = 6*4 + 8 + 4
 
 	// The scheduler re-sends everything every 10 seconds. State that has
 	// not been refreshed for this long is no longer exported.
@@ -46,7 +47,7 @@ const (
 	rejectReasons     = 2
 )
 
-var releaseReasonNames = [releaseReasons]string{"quantum", "idle", "exit", "off"}
+var releaseReasonNames = [releaseReasons]string{"quantum", "idle", "exit", "off", "memory"}
 
 var rejectReasonNames = [rejectReasons]string{"version", "malformed"}
 
@@ -62,6 +63,7 @@ type podStats struct {
 	WaitMS       uint64
 	Acquisitions uint64
 	Releases     [releaseReasons]uint64
+	MemoryMiB    uint64
 }
 
 type schedStats struct {
@@ -70,6 +72,7 @@ type schedStats struct {
 	Clients         uint32
 	QueueLength     uint32
 	DroppedMessages uint64
+	Parallel        uint32
 }
 
 type podKey struct {
@@ -108,9 +111,11 @@ type MetricsCollector struct {
 	lockHolding     *prometheus.Desc
 	lockWaiting     *prometheus.Desc
 	podClients      *prometheus.Desc
+	podMemory       *prometheus.Desc
 
 	// Labels: node.
 	schedEnabled     *prometheus.Desc
+	schedParallel    *prometheus.Desc
 	schedTimeQuantum *prometheus.Desc
 	schedClients     *prometheus.Desc
 	schedQueueLength *prometheus.Desc
@@ -134,7 +139,7 @@ func newMetricsCollector(port int, node, gpuUUID string, now func() time.Time) *
 
 		lockHeldSeconds: prometheus.NewDesc(
 			"nvshare_pod_gpu_lock_held_seconds_total",
-			"Total seconds each pod has held the exclusive nvshare GPU lock.",
+			"Total seconds each pod has held the nvshare GPU lock.",
 			podLabels, nil),
 		lockWaitSeconds: prometheus.NewDesc(
 			"nvshare_pod_gpu_lock_wait_seconds_total",
@@ -146,7 +151,7 @@ func newMetricsCollector(port int, node, gpuUUID string, now func() time.Time) *
 			podLabels, nil),
 		lockReleases: prometheus.NewDesc(
 			"nvshare_pod_gpu_lock_releases_total",
-			"Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired while another process was waiting), idle (released on its own), exit (process went away), off (scheduler turned off or stopped).",
+			"Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired while another process was waiting), idle (released on its own), exit (process went away), off (scheduler turned off or stopped), memory (parallel GPU use ended).",
 			append(podLabels, "reason"), nil),
 		lockHolding: prometheus.NewDesc(
 			"nvshare_pod_gpu_lock_holding",
@@ -160,10 +165,18 @@ func newMetricsCollector(port int, node, gpuUUID string, now func() time.Time) *
 			"nvshare_pod_gpu_clients",
 			"Number of the pod's processes connected to the nvshare scheduler.",
 			podLabels, nil),
+		podMemory: prometheus.NewDesc(
+			"nvshare_pod_gpu_memory_allocated_bytes",
+			"GPU memory the pod's processes have allocated, as they reported it to the nvshare scheduler.",
+			podLabels, nil),
 
 		schedEnabled: prometheus.NewDesc(
 			"nvshare_scheduler_enabled",
 			"1 if the nvshare scheduler is on (GPU access is serialized), 0 if it was turned off.",
+			nodeLabels, nil),
+		schedParallel: prometheus.NewDesc(
+			"nvshare_scheduler_parallel",
+			"1 if the GPU memory of all connected processes fits on the GPU together, so they may hold the nvshare GPU lock at the same time.",
 			nodeLabels, nil),
 		schedTimeQuantum: prometheus.NewDesc(
 			"nvshare_scheduler_time_quantum_seconds",
@@ -210,8 +223,8 @@ func nodeName() string {
 func (mc *MetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	for _, desc := range []*prometheus.Desc{
 		mc.lockHeldSeconds, mc.lockWaitSeconds, mc.locksAcquired, mc.lockReleases,
-		mc.lockHolding, mc.lockWaiting, mc.podClients,
-		mc.schedEnabled, mc.schedTimeQuantum, mc.schedClients, mc.schedQueueLength,
+		mc.lockHolding, mc.lockWaiting, mc.podClients, mc.podMemory,
+		mc.schedEnabled, mc.schedParallel, mc.schedTimeQuantum, mc.schedClients, mc.schedQueueLength,
 		mc.schedDropped, mc.schedLastUpdate, mc.messagesRejected,
 	} {
 		ch <- desc
@@ -249,6 +262,7 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		gauge(mc.lockHolding, float64(s.Holding))
 		gauge(mc.lockWaiting, float64(s.Waiting))
 		gauge(mc.podClients, float64(s.Clients))
+		gauge(mc.podMemory, float64(s.MemoryMiB)*(1<<20))
 	}
 
 	for i, reason := range rejectReasonNames {
@@ -265,6 +279,7 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(mc.schedEnabled, prometheus.GaugeValue, float64(mc.sched.SchedulerOn), mc.node)
+	ch <- prometheus.MustNewConstMetric(mc.schedParallel, prometheus.GaugeValue, float64(mc.sched.Parallel), mc.node)
 	ch <- prometheus.MustNewConstMetric(mc.schedTimeQuantum, prometheus.GaugeValue, float64(mc.sched.TQSeconds), mc.node)
 	ch <- prometheus.MustNewConstMetric(mc.schedClients, prometheus.GaugeValue, float64(mc.sched.Clients), mc.node)
 	ch <- prometheus.MustNewConstMetric(mc.schedQueueLength, prometheus.GaugeValue, float64(mc.sched.QueueLength), mc.node)
@@ -400,6 +415,7 @@ func parseMetricsMessage(buf []byte) (any, error) {
 		for i := range m.Releases {
 			m.Releases[i] = le.Uint64(buf[off+8*i:])
 		}
+		m.MemoryMiB = le.Uint64(buf[off+8*releaseReasons:])
 		return m, nil
 
 	case msgSchedStats:
@@ -412,6 +428,7 @@ func parseMetricsMessage(buf []byte) (any, error) {
 			Clients:         le.Uint32(buf[16:]),
 			QueueLength:     le.Uint32(buf[20:]),
 			DroppedMessages: le.Uint64(buf[24:]),
+			Parallel:        le.Uint32(buf[32:]),
 		}, nil
 
 	default:

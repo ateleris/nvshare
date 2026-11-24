@@ -35,6 +35,8 @@
 #include "client.h"
 #include "cuda_defs.h"
 
+#define MEM_REPORT_STEP_MIB 64
+
 void *client_fn(void *arg __attribute__((unused)));
 void *release_early_fn(void *arg __attribute__((unused)));
 
@@ -52,6 +54,7 @@ int release_early_check_interval = 5;
 int own_lock;
 int need_lock;
 int did_work;
+size_t reported_mem_mib;
 uint64_t nvshare_client_id;
 char nvscheduler_socket_path[NVSHARE_SOCK_PATH_MAX];
 
@@ -64,6 +67,51 @@ static void cuda_sync_context(void) {
 	cuda_driver_check_error(cu_err, CUDA_SYMBOL_STRING(cuCtxSetCurrent));
 	cu_err = real_cuCtxSynchronize();
 	cuda_driver_check_error(cu_err, CUDA_SYMBOL_STRING(cuCtxSynchronize));
+}
+
+
+static size_t gpu_mem_mib(void)
+{
+	CUdevice dev;
+	size_t bytes;
+
+	if (real_cuDeviceGet == NULL || real_cuDeviceTotalMem == NULL ||
+	    real_cuDeviceGet(&dev, 0) != CUDA_SUCCESS ||
+	    real_cuDeviceTotalMem(&bytes, dev) != CUDA_SUCCESS)
+		return 0;
+	return bytes >> 20;
+}
+
+
+static size_t allocated_mem_mib(void)
+{
+	size_t step = (size_t)MEM_REPORT_STEP_MIB MiB;
+
+	return (sum_allocated + step - 1) / step * MEM_REPORT_STEP_MIB;
+}
+
+
+static void send_mem_usage(size_t mib)
+{
+	struct message msg = {0};
+
+	msg.type = MEM_USAGE;
+	msg.id = nvshare_client_id;
+	snprintf(msg.data, sizeof(msg.data), "%zu", mib);
+	true_or_exit(write_whole(rsock, &msg, sizeof(msg)) == sizeof(msg));
+	log_debug("Sent %s (%zu MiB)", message_type_string[msg.type], mib);
+	reported_mem_mib = mib;
+}
+
+
+void report_mem_growth(void)
+{
+	size_t mib;
+
+	true_or_exit(pthread_mutex_lock(&global_mutex) == 0);
+	mib = allocated_mem_mib();
+	if (mib > reported_mem_mib) send_mem_usage(mib);
+	true_or_exit(pthread_mutex_unlock(&global_mutex) == 0);
 }
 
 
@@ -215,6 +263,7 @@ void *client_fn(void *arg __attribute__((unused)))
 	struct message in_msg;
 	struct message out_msg;
 	CUresult cu_err = CUDA_SUCCESS;
+	size_t gpu_mib;
 
 	memset(&out_msg, 0, sizeof(out_msg));
 	out_msg.id = 1234;
@@ -246,6 +295,10 @@ void *client_fn(void *arg __attribute__((unused)))
 	true_or_exit(nvshare_get_scheduler_path(nvscheduler_socket_path) == 0);
 
 	out_msg.type = REGISTER;
+	gpu_mib = gpu_mem_mib();
+	if (gpu_mib > 0)
+		snprintf(out_msg.data, sizeof(out_msg.data), "%zu", gpu_mib);
+	else log_warn("Could not determine the size of the GPU memory");
 
 	true_or_exit(nvshare_connect(&rsock, nvscheduler_socket_path) == 0);
 	true_or_exit(write_whole(rsock, &out_msg, sizeof(out_msg)) == sizeof(out_msg));
@@ -360,7 +413,7 @@ void *release_early_fn(void *arg __attribute__((unused)))
 	struct timespec cuda_sync_start_time = {0, 0};
 	struct timespec cuda_sync_complete_time = {0, 0};
 	struct timespec cuda_sync_duration = {0, 0};
-	int ret;
+	int ret, busy;
 	unsigned int elapsed_ms;
 	nvmlReturn_t nvml_ret;
 	nvmlDevice_t nvml_dev;
@@ -402,6 +455,8 @@ wait_remainder:
 			                     &timer_end_ts);
 		/* We've locked global_mutex */
 		if (ret == ETIMEDOUT) {
+			if (allocated_mem_mib() != reported_mem_mib)
+				send_mem_usage(allocated_mem_mib());
 			if (!scheduler_on || !own_lock) continue;
 			if (did_work) {
 				did_work = 0;
@@ -418,7 +473,13 @@ wait_remainder:
 			 * Since "doing work" means keeping the GPU busy, we
 			 * use NVML to get the GPU utilization rate and
 			 * deduce whether the client is actually idle or not.
+			 *
+			 * A busy GPU does not mean that we are the ones
+			 * keeping it busy, as other clients can hold the lock
+			 * at the same time as us. In that case, or if NVML
+			 * fails, check our own CUDA context.
 			 */
+			busy = 1;
 			if (nvml_ok) {
 				nvml_ret = real_nvmlDeviceGetUtilizationRates(nvml_dev, &nvml_util);
 				if (nvml_ret != NVML_SUCCESS) {
@@ -435,14 +496,11 @@ wait_remainder:
 					log_warn("nvmlInit failed with %d", (int)nvml_ret);
 					nvml_ok = 0; /* Stop using NVML */
 					continue;
-				} else {
-					log_debug("GPU Utilization = %u %%", nvml_util.gpu);
-					if (nvml_util.gpu > 0) {
-						log_debug("Early release timer elapsed but we are not idle");
-						continue;
-					}
 				}
-			} else { /* FALLBACK method in case NVML fails */ 
+				log_debug("GPU Utilization = %u %%", nvml_util.gpu);
+				busy = nvml_util.gpu > 0;
+			}
+			if (busy) {
 				/*
 				 * The idea is the following:
 				 *

@@ -41,11 +41,14 @@
 
 #define NVSHARE_DEFAULT_TQ 30
 #define ENV_NVSHARE_TQ "NVSHARE_TQ"
+#define ENV_NVSHARE_PARALLEL "NVSHARE_PARALLEL"
+#define CLIENT_MEM_RESERVE_MIB 1536
+#define MEM_MIB_MAX UINT32_MAX
 
-int lock_held;
 int must_reset_timer;
 int quantum_expired;
-int drop_lock_sent;
+int parallel_allowed;
+int parallel;
 pthread_cond_t timer_cv;
 int scheduler_on;
 int tq;
@@ -76,9 +79,10 @@ void *timer_thr_fn(void *arg __attribute__((unused)));
 static void bcast_status(void);
 static int send_message(struct nvshare_client *client, struct message *msg_p);
 static int receive_message(struct nvshare_client *client, struct message *msg_p);
-static void try_schedule(void);
-static void preempt_holder(void);
+static void schedule(void);
+static void preempt_if_due(void);
 static int parse_tq(const char *str, int *newtq);
+static int parse_mib(const char *str, uint64_t *mib);
 static int register_client(struct nvshare_client *client, const struct message *in_msg);
 static int has_registered(struct nvshare_client *client);
 static void client_id_as_string(char *buf, size_t buflen, uint64_t id);
@@ -145,6 +149,8 @@ static void insert_req(struct nvshare_client *client)
 	true_or_exit(r = malloc(sizeof *r));
 	r->next = NULL;
 	r->client = client;
+	r->holding = 0;
+	r->drop_sent = 0;
 	LL_APPEND(requests, r);
 	metrics_lock_requested(client);
 }
@@ -152,13 +158,6 @@ static void insert_req(struct nvshare_client *client)
 static void remove_req(struct nvshare_client *client)
 {
 	struct nvshare_request *tmp, *r;
-	if (requests != NULL) {
-		/*
-		 * This client was holding the GPU lock, as it was the head of
-		 * the requests list.
-		 */
-		if (requests->client->fd == client->fd) lock_held = 0;
-	}
 	LL_FOREACH_SAFE(requests, r, tmp) {
 		if (r->client->fd == client->fd) {
 			LL_DELETE(requests, r);
@@ -307,49 +306,105 @@ static int receive_message(struct nvshare_client *client, struct message *msg_p)
 	return 0;
 }
 
-/*
- * Try to assign the GPU lock to a client in the requests list in FCFS order.
- *
- * Return only on successful assignment of GPU lock to a client or if the
- * requests list is empty.
- */
-static void try_schedule(void)
+static struct nvshare_request *first_waiter(void)
 {
-	int ret;
+	struct nvshare_request *r;
 
-try_again:
-	if (requests == NULL) {
-		log_debug("try_schedule() called with no pending requests");
-		return;
-	} else {
-		out_msg.type = LOCK_OK;
-		/* FCFS, use head of requests list */
-		ret = send_message(requests->client, &out_msg);
-		if (ret < 0) { /* Client's dead to us */
-			delete_client(requests->client);
-			goto try_again;
-		}
-		scheduling_round++;
-		lock_held = 1;
-		quantum_expired = 0;
-		drop_lock_sent = 0;
-		must_reset_timer = 1;
-		pthread_cond_broadcast(&timer_cv);
-
-		metrics_lock_acquired(requests->client);
+	LL_FOREACH(requests, r) {
+		if (!r->holding) return r;
 	}
+	return NULL;
 }
 
 
-static void preempt_holder(void)
+static void start_quantum(void)
 {
+	scheduling_round++;
+	quantum_expired = 0;
+	must_reset_timer = 1;
+	pthread_cond_broadcast(&timer_cv);
+}
+
+
+static int memory_fits(void)
+{
+	struct nvshare_client *c;
+	uint64_t total = 0, needed = 0;
+	int n = 0, fits;
+
+	LL_FOREACH(clients, c) {
+		if (!has_registered(c)) continue;
+		total = (n++ == 0) ? c->gpu_mem_mib : min(total, c->gpu_mem_mib);
+		needed += c->mem_mib + CLIENT_MEM_RESERVE_MIB;
+	}
+	fits = parallel_allowed && needed <= total;
+
+	if (fits != parallel) {
+		parallel = fits;
+		if (parallel_allowed)
+			log_info("GPU memory of all clients %s (%" PRIu64 " of %"
+				 PRIu64 " MiB): %s", fits ? "fits" : "does not fit",
+				 needed, total, fits ? "parallel GPU use" :
+				 "one client at a time");
+		metrics_scheduler_state(scheduler_on, tq, parallel);
+	}
+	return fits;
+}
+
+
+/*
+ * Hand out the GPU lock.
+ *
+ * The clients that hold the lock are always at the front of the requests
+ * list. While the memory of all clients fits on the GPU, every client that
+ * asks for the lock gets it. Otherwise only the head of the list holds it,
+ * FCFS, and any other holder is asked to give it back.
+ */
+static void schedule(void)
+{
+	struct nvshare_request *r;
+	int fits;
+
+again:
+	fits = memory_fits();
+	LL_FOREACH(requests, r) {
+		if (r->holding) {
+			if (fits || r == requests || r->drop_sent) continue;
+			out_msg.type = DROP_LOCK;
+		} else {
+			if (!fits && requests->holding) break;
+			out_msg.type = LOCK_OK;
+		}
+		if (send_message(r->client, &out_msg) < 0) { /* Client's dead to us */
+			delete_client(r->client);
+			goto again;
+		}
+		if (r->holding) {
+			r->drop_sent = 1;
+			metrics_drop_sent(r->client, METRICS_RELEASE_MEMORY);
+		} else {
+			r->holding = 1;
+			start_quantum();
+			metrics_lock_acquired(r->client);
+		}
+	}
+	preempt_if_due();
+}
+
+
+static void preempt_if_due(void)
+{
+	if (!quantum_expired || requests == NULL || !requests->holding ||
+	    requests->drop_sent || first_waiter() == NULL)
+		return;
+
 	out_msg.type = DROP_LOCK;
 	if (send_message(requests->client, &out_msg) < 0) {
 		delete_client(requests->client);
-		try_schedule();
+		schedule();
 	} else { /* All good */
-		drop_lock_sent = 1;
-		metrics_drop_sent(requests->client);
+		requests->drop_sent = 1;
+		metrics_drop_sent(requests->client, METRICS_RELEASE_QUANTUM);
 	}
 }
 
@@ -365,6 +420,21 @@ static int parse_tq(const char *str, int *newtq)
 	    val <= 0 || val > INT_MAX)
 		return -1;
 	*newtq = (int)val;
+	return 0;
+}
+
+
+static int parse_mib(const char *str, uint64_t *mib)
+{
+	char *endptr;
+	unsigned long long val;
+
+	errno = 0;
+	val = strtoull(str, &endptr, 10);
+	if (str == endptr || *endptr != '\0' || errno != 0 || *str == '-' ||
+	    val > MEM_MIB_MAX)
+		return -1;
+	*mib = val;
 	return 0;
 }
 
@@ -397,8 +467,6 @@ remainder:
 		/* Wake up with global_mutex held, can do whatever we want */
 		if (ret == ETIMEDOUT) { /* TQ elapsed */
 			log_debug("TQ elapsed");
-			if (!lock_held) continue; /* Life is meaningless :( */
-			if (drop_lock_sent) continue; /* Send it only once */
 			/*
 			 * We use round_at_stat and scheduling_round to enable
 			 * us to uniquely order (and by extent identify) every
@@ -411,7 +479,7 @@ remainder:
 			 */
 			if (round_at_start != scheduling_round) continue;
 			quantum_expired = 1;
-			if (requests->next != NULL) preempt_holder();
+			preempt_if_due();
 		} else if (ret != 0) { /* Unrecoverable error */
 			errno = ret;
 			log_fatal("pthread_cond_timedwait()");
@@ -426,6 +494,7 @@ remainder:
 static void process_msg(struct nvshare_client *client, const struct message *in_msg)
 {
 	int newtq;
+	uint64_t mib;
 	char id_str[HEX_STR_LEN(client->id)];
 
 	client_id_as_string(id_str, sizeof(id_str), client->id);
@@ -440,7 +509,12 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			log_info("Registered client %016" PRIx64 " with Pod"
 				 " name = %s, Pod namespace = %s", client->id,
 				 client->pod_name, client->pod_namespace);
+			if (parse_mib(in_msg->data, &client->gpu_mem_mib) != 0)
+				log_warn("Client %016" PRIx64 " did not report the"
+					 " size of the GPU memory. No parallel GPU"
+					 " use while it is connected", client->id);
 			metrics_client_registered(client);
+			schedule();
 		}
 		break;
 
@@ -456,7 +530,7 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			scheduler_on = 1;
 			log_info("Scheduler turned ON, broadcasting it...");
 			bcast_status();
-			metrics_scheduler_state(scheduler_on, tq);
+			metrics_scheduler_state(scheduler_on, tq, parallel);
 		}
 		break;
 
@@ -477,13 +551,12 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			 * so the current lock holder's time is billed (not
 			 * silently dropped when their request is freed).
 			 */
-			metrics_scheduler_state(scheduler_on, tq);
+			metrics_scheduler_state(scheduler_on, tq, parallel);
 			struct nvshare_request *tmp, *r;
 			LL_FOREACH_SAFE(requests, r, tmp) {
 				LL_DELETE(requests, r);
 				free(r);
 			}
-			lock_held = 0;
 		}
 		break;
 
@@ -497,9 +570,36 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			must_reset_timer = 1;
 			pthread_cond_broadcast(&timer_cv); /* Reset timer on TQ change */
 			log_info("New TQ = %d", tq);
-			metrics_scheduler_state(scheduler_on, tq);
+			metrics_scheduler_state(scheduler_on, tq, parallel);
 		}
 		else log_info("Failed to parse new TQ from message");
+		break;
+
+	case SET_PARALLEL: /* nvsharectl */
+		log_info("Received %s from %s",
+			 message_type_string[in_msg->type], id_str);
+
+		if (parse_mib(in_msg->data, &mib) == 0 && mib <= 1) {
+			parallel_allowed = (int)mib;
+			log_info("Parallel GPU use turned %s",
+				 parallel_allowed ? "ON" : "OFF");
+			schedule();
+		}
+		else log_info("Failed to parse parallel setting from message");
+		break;
+
+	case MEM_USAGE: /* client */
+		log_debug("Received %s from %s",
+			  message_type_string[in_msg->type], id_str);
+
+		if (!has_registered(client)) {
+			delete_client(client);
+		} else if (parse_mib(in_msg->data, &mib) == 0) {
+			client->mem_mib = mib;
+			metrics_client_memory(client);
+			schedule();
+		}
+		else log_info("Failed to parse memory usage from message");
 		break;
 
 	case REQ_LOCK: /* client */
@@ -509,10 +609,7 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 		if (has_registered(client)) {
 			if (scheduler_on) {
 				insert_req(client);
-				if (!lock_held) try_schedule();
-				else if (quantum_expired && !drop_lock_sent &&
-					 requests->next != NULL)
-					preempt_holder();
+				schedule();
 			}
 		} else { /* The client is not registered. Slam the door. */
 			delete_client(client);
@@ -531,7 +628,7 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			if (scheduler_on) {
 				metrics_lock_released(client);
 				remove_req(client);
-				if (!lock_held) try_schedule();
+				schedule();
 			}
 		} else { /* The client is not registered. Slam the door. */
 			delete_client(client);
@@ -550,7 +647,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	pthread_t timer_tid;
 	struct nvshare_client *client;
 	int ret, err, lsock, rsock, num_fds;
-	char *debug_val, *tq_val;
+	char *debug_val, *tq_val, *parallel_val;
 	pthread_condattr_t timer_cv_attr;
 	struct message in_msg = {0};
 	struct epoll_event event, events[EPOLL_MAX_EVENTS];
@@ -600,6 +697,10 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 		log_fatal("%s must be a positive number of seconds, got '%s'",
 			  ENV_NVSHARE_TQ, tq_val);
 	log_info("TQ = %d", tq);
+	parallel_val = getenv(ENV_NVSHARE_PARALLEL);
+	parallel_allowed = parallel_val == NULL || strcmp(parallel_val, "0") != 0;
+	parallel = parallel_allowed;
+	log_info("Parallel GPU use = %s", parallel_allowed ? "ON" : "OFF");
 
 	/* Seed srand() for generating client IDs */
 	srand((unsigned int)(time(NULL)));
@@ -609,7 +710,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	true_or_exit(pthread_condattr_setclock(&timer_cv_attr, CLOCK_MONOTONIC) == 0);
 	true_or_exit(pthread_cond_init(&timer_cv, &timer_cv_attr) == 0);
 
-	metrics_init(scheduler_on, tq);
+	metrics_init(scheduler_on, tq, parallel);
 
 	/*
 	 * Install a signalfd for SIGTERM/SIGINT. The signals are blocked
@@ -721,6 +822,8 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 					client->fd = rsock;
 					client->id = NVSHARE_UNREGISTERED_ID;
 					client->next = NULL;
+					client->gpu_mem_mib = 0;
+					client->mem_mib = 0;
 					client->pod_verified = pod_identity_of_peer(
 						rsock, client->pod_namespace,
 						sizeof(client->pod_namespace),
@@ -759,7 +862,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 					ret = receive_message(client, &in_msg);
 					if (ret < 0) {
 						delete_client(client);
-						if (!lock_held && scheduler_on) try_schedule();
+						schedule();
 					}
 					else process_msg(client, &in_msg); /* OK */
 
@@ -771,8 +874,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 				 */
 				else if (events[i].events & (EPOLLERR | EPOLLHUP)) {
 					delete_client(client);
-					if (!lock_held && scheduler_on)
-						try_schedule();
+					schedule();
 				}
 
 			}

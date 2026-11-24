@@ -35,6 +35,7 @@ func buildPodStats(version uint32, s podStats) []byte {
 	for i, v := range s.Releases {
 		le.PutUint64(buf[off+8*i:], v)
 	}
+	le.PutUint64(buf[off+8*releaseReasons:], s.MemoryMiB)
 	return buf
 }
 
@@ -48,6 +49,7 @@ func buildSchedStats(version uint32, s schedStats) []byte {
 	le.PutUint32(buf[16:], s.Clients)
 	le.PutUint32(buf[20:], s.QueueLength)
 	le.PutUint64(buf[24:], s.DroppedMessages)
+	le.PutUint32(buf[32:], s.Parallel)
 	return buf
 }
 
@@ -65,7 +67,8 @@ var goldenPodStats = podStats{
 	HeldMS:       0x1122334455667788,
 	WaitMS:       12345,
 	Acquisitions: 7,
-	Releases:     [releaseReasons]uint64{4, 3, 2, 1},
+	Releases:     [releaseReasons]uint64{4, 3, 2, 1, 5},
+	MemoryMiB:    4096,
 }
 
 var goldenSchedStats = schedStats{
@@ -74,6 +77,7 @@ var goldenSchedStats = schedStats{
 	Clients:         5,
 	QueueLength:     3,
 	DroppedMessages: 0x0102030405060708,
+	Parallel:        1,
 }
 
 func TestParsePodStats_AgainstCGolden(t *testing.T) {
@@ -170,7 +174,8 @@ func TestCollector_ExportsSchedulerState(t *testing.T) {
 		HeldMS:       90500,
 		WaitMS:       30250,
 		Acquisitions: 4,
-		Releases:     [releaseReasons]uint64{3, 1, 0, 0},
+		Releases:     [releaseReasons]uint64{3, 1, 0, 0, 2},
+		MemoryMiB:    2048,
 	}))
 	mc.handleDatagram(buildSchedStats(protocolVersion, schedStats{
 		SchedulerOn:     1,
@@ -178,6 +183,7 @@ func TestCollector_ExportsSchedulerState(t *testing.T) {
 		Clients:         3,
 		QueueLength:     2,
 		DroppedMessages: 5,
+		Parallel:        1,
 	}))
 
 	want := `
@@ -188,16 +194,17 @@ nvshare_device_plugin_metrics_rejected_total{node="node-1",reason="version"} 0
 # HELP nvshare_pod_gpu_clients Number of the pod's processes connected to the nvshare scheduler.
 # TYPE nvshare_pod_gpu_clients gauge
 nvshare_pod_gpu_clients{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 2
-# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the exclusive nvshare GPU lock.
+# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_held_seconds_total counter
 nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 90.5
 # HELP nvshare_pod_gpu_lock_holding 1 if the pod currently holds the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_holding gauge
 nvshare_pod_gpu_lock_holding{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 1
-# HELP nvshare_pod_gpu_lock_releases_total Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired while another process was waiting), idle (released on its own), exit (process went away), off (scheduler turned off or stopped).
+# HELP nvshare_pod_gpu_lock_releases_total Total number of times each pod has given up the nvshare GPU lock, by reason: quantum (time quantum expired while another process was waiting), idle (released on its own), exit (process went away), off (scheduler turned off or stopped), memory (parallel GPU use ended).
 # TYPE nvshare_pod_gpu_lock_releases_total counter
 nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="exit"} 0
 nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="idle"} 1
+nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="memory"} 2
 nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="off"} 0
 nvshare_pod_gpu_lock_releases_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1",reason="quantum"} 3
 # HELP nvshare_pod_gpu_lock_wait_seconds_total Total seconds each pod has spent queued for the nvshare GPU lock.
@@ -209,6 +216,9 @@ nvshare_pod_gpu_lock_waiting{gpu_uuid="GPU-test",namespace="team-a",node="node-1
 # HELP nvshare_pod_gpu_locks_acquired_total Total number of times each pod has acquired the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_locks_acquired_total counter
 nvshare_pod_gpu_locks_acquired_total{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 4
+# HELP nvshare_pod_gpu_memory_allocated_bytes GPU memory the pod's processes have allocated, as they reported it to the nvshare scheduler.
+# TYPE nvshare_pod_gpu_memory_allocated_bytes gauge
+nvshare_pod_gpu_memory_allocated_bytes{gpu_uuid="GPU-test",namespace="team-a",node="node-1",pod="train-1"} 2.147483648e+09
 # HELP nvshare_scheduler_clients Number of processes connected to the nvshare scheduler.
 # TYPE nvshare_scheduler_clients gauge
 nvshare_scheduler_clients{node="node-1"} 3
@@ -224,6 +234,9 @@ nvshare_scheduler_lock_queue_length{node="node-1"} 2
 # HELP nvshare_scheduler_metrics_dropped_total Total number of metrics messages the scheduler could not deliver.
 # TYPE nvshare_scheduler_metrics_dropped_total counter
 nvshare_scheduler_metrics_dropped_total{node="node-1"} 5
+# HELP nvshare_scheduler_parallel 1 if the GPU memory of all connected processes fits on the GPU together, so they may hold the nvshare GPU lock at the same time.
+# TYPE nvshare_scheduler_parallel gauge
+nvshare_scheduler_parallel{node="node-1"} 1
 # HELP nvshare_scheduler_time_quantum_seconds Time quantum after which the lock holder is asked to release the GPU if another process is waiting for it.
 # TYPE nvshare_scheduler_time_quantum_seconds gauge
 nvshare_scheduler_time_quantum_seconds{node="node-1"} 30
@@ -242,7 +255,7 @@ func TestCollector_LaterMessageReplacesEarlier(t *testing.T) {
 	mc.handleDatagram(buildPodStats(protocolVersion, podStats{Namespace: "ns", Pod: "p", HeldMS: 25000, Acquisitions: 2}))
 
 	want := `
-# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the exclusive nvshare GPU lock.
+# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_held_seconds_total counter
 nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="ns",node="node-1",pod="p"} 25
 # HELP nvshare_pod_gpu_locks_acquired_total Total number of times each pod has acquired the nvshare GPU lock.
@@ -270,7 +283,7 @@ func TestCollector_CountsInvalidMessages(t *testing.T) {
 # TYPE nvshare_device_plugin_metrics_rejected_total counter
 nvshare_device_plugin_metrics_rejected_total{node="node-1",reason="malformed"} 2
 nvshare_device_plugin_metrics_rejected_total{node="node-1",reason="version"} 2
-# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the exclusive nvshare GPU lock.
+# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_held_seconds_total counter
 nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="ns",node="node-1",pod="good"} 10
 `
@@ -297,7 +310,7 @@ func TestCollector_DropsStaleState(t *testing.T) {
 	clock.t = clock.t.Add(2 * time.Second)
 
 	want := `
-# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the exclusive nvshare GPU lock.
+# HELP nvshare_pod_gpu_lock_held_seconds_total Total seconds each pod has held the nvshare GPU lock.
 # TYPE nvshare_pod_gpu_lock_held_seconds_total counter
 nvshare_pod_gpu_lock_held_seconds_total{gpu_uuid="GPU-test",namespace="ns",node="node-1",pod="fresh"} 2
 # HELP nvshare_scheduler_last_update_timestamp_seconds Unix time of the last message received from the nvshare scheduler.

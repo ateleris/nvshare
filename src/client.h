@@ -19,6 +19,7 @@
 
 extern void continue_with_lock(void);
 extern void initialize_client(void);
+extern void report_mem_growth(void);
 
 #endif /* _NVSHARE_CLIENT_H */
 
