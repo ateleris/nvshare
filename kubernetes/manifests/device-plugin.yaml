@@ -29,7 +29,7 @@ spec:
       priorityClassName: system-node-critical
       containers:
       - name: nvshare-lib
-        image: ghcr.io/ateleris/nvshare:libnvshare-v1.1.0
+        image: ghcr.io/ateleris/nvshare:libnvshare-v1.2.0
         command:
         - sleep
         - infinity
@@ -58,7 +58,7 @@ spec:
           # mount for /var/run/nvshare/libnvshare.so
           mountPropagation: Bidirectional
       - name: nvshare-device-plugin
-        image: ghcr.io/ateleris/nvshare:device-plugin-v1.1.0
+        image: ghcr.io/ateleris/nvshare:device-plugin-v1.2.0
         imagePullPolicy: IfNotPresent
         env:
         - name: NVSHARE_VIRTUAL_DEVICES
