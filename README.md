@@ -50,7 +50,7 @@ NVIDIA's device plugin assigns GPUs to containers one-to-one. That wastes the GP
 ### Components
 
 - **`libnvshare.so`** is injected into CUDA applications through `LD_PRELOAD`. It turns normal memory allocations into Unified Memory allocations and asks the scheduler for the GPU whenever the application wants to compute on it.
-- **`nvshare-scheduler`** manages one GPU. It hands the GPU lock to one client at a time, first come first served, for at most TQ seconds.
+- **`nvshare-scheduler`** manages one GPU. It hands the GPU lock to one client at a time, first come first served. A client keeps the lock for at most TQ seconds while others wait for it.
 - **`nvsharectl`** is a command-line tool to configure a running scheduler.
 - **`nvshare-device-plugin`** (Kubernetes only) takes one `nvidia.com/gpu` from NVIDIA's device plugin, offers it as several `nvshare.com/gpu` devices, injects `libnvshare.so` into the pods that request one, and serves the metrics.
 
@@ -79,7 +79,7 @@ flowchart LR
 
 ### Scheduling
 
-Each application uses the GPU for at most TQ seconds and releases it early when it has nothing to compute. When it needs the GPU again, it asks the scheduler again, and once it holds the lock it gradually fetches its data back to the GPU through page faults.
+While other applications wait, each application uses the GPU for at most TQ seconds. It releases it early when it has nothing to compute. An application that nobody waits for keeps the lock past its TQ and gives it up as soon as another one asks. When it needs the GPU again, it asks the scheduler again, and once it holds the lock it gradually fetches its data back to the GPU through page faults.
 
 ```mermaid
 sequenceDiagram
@@ -291,6 +291,7 @@ Environment variables of the scheduler and the device plugin:
 | Variable | Component | Effect |
 |---|---|---|
 | `NVSHARE_DEBUG=1` | scheduler | Print debug logs. |
+| `NVSHARE_TQ` | scheduler | Time quantum in seconds at startup, 30 by default. `nvsharectl -T` changes it until the next restart. |
 | `NVSHARE_VIRTUAL_DEVICES` | device plugin | Number of `nvshare.com/gpu` devices to offer per GPU. Required, 10 in the provided manifest. |
 | `NVSHARE_METRICS_PORT` | device plugin | Port of the metrics endpoint, 8080 by default. |
 

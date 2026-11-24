@@ -40,9 +40,12 @@
 #include "pod_identity.h"
 
 #define NVSHARE_DEFAULT_TQ 30
+#define ENV_NVSHARE_TQ "NVSHARE_TQ"
 
 int lock_held;
 int must_reset_timer;
+int quantum_expired;
+int drop_lock_sent;
 pthread_cond_t timer_cv;
 int scheduler_on;
 int tq;
@@ -73,6 +76,8 @@ static void bcast_status(void);
 static int send_message(struct nvshare_client *client, struct message *msg_p);
 static int receive_message(struct nvshare_client *client, struct message *msg_p);
 static void try_schedule(void);
+static void preempt_holder(void);
+static int parse_tq(const char *str, int *newtq);
 static int register_client(struct nvshare_client *client, const struct message *in_msg);
 static int has_registered(struct nvshare_client *client);
 static void client_id_as_string(char *buf, size_t buflen, uint64_t id);
@@ -319,11 +324,46 @@ try_again:
 		}
 		scheduling_round++;
 		lock_held = 1;
+		quantum_expired = 0;
+		drop_lock_sent = 0;
 		must_reset_timer = 1;
 		pthread_cond_broadcast(&timer_cv);
 
 		metrics_lock_acquired(requests->client);
 	}
+}
+
+
+/*
+ * Ask the client that holds the GPU lock to give it back.
+ *
+ * Strict handling of clients. If something goes wrong, clean them up.
+ */
+static void preempt_holder(void)
+{
+	out_msg.type = DROP_LOCK;
+	if (send_message(requests->client, &out_msg) < 0) {
+		delete_client(requests->client);
+		try_schedule();
+	} else { /* All good */
+		drop_lock_sent = 1;
+		metrics_drop_sent(requests->client);
+	}
+}
+
+
+static int parse_tq(const char *str, int *newtq)
+{
+	char *endptr;
+	long long val;
+
+	errno = 0;
+	val = strtoll(str, &endptr, 0);
+	if (str == endptr || *endptr != '\0' || errno != 0 ||
+	    val <= 0 || val > INT_MAX)
+		return -1;
+	*newtq = (int)val;
+	return 0;
 }
 
 
@@ -334,19 +374,15 @@ try_again:
  * When a client obtains the GPU lock, the timer resets.
  *
  * When TQ elapses, it sends a DROP_LOCK message to the client that holds the
- * lock.
+ * lock, but only if another client is waiting for it. Otherwise the holder
+ * keeps the lock until another client requests it.
  */
 
 void *timer_thr_fn(void *arg __attribute__((unused)))
 {
-	struct message t_msg = {0};
 	unsigned int round_at_start;
 	struct timespec timer_end_ts = {0, 0};
 	int ret;
-	int drop_lock_sent = 0;
-
-	t_msg.id = 1337; /* Nobody checks this */
-	t_msg.type = DROP_LOCK;
 
 	true_or_exit(pthread_mutex_lock(&global_mutex) == 0);
 	while (1) {
@@ -371,32 +407,15 @@ remainder:
 			 * thus erroneously sending a DROP_LOCK to the wrong
 			 * client.
 			 */
-			if (round_at_start != scheduling_round) {
-				drop_lock_sent = 0;
-				continue;
-			}
-			/*
-			 * Strict handling of clients. If something goes wrong,
-			 * clean them up.
-			 */
-			if (send_message(requests->client, &t_msg) < 0) {
-				delete_client(requests->client);
-				try_schedule();
-				drop_lock_sent = 0;
-			} else { /* All good */
-				drop_lock_sent = 1;
-				metrics_drop_sent(requests->client);
-			}
+			if (round_at_start != scheduling_round) continue;
+			quantum_expired = 1;
+			if (requests->next != NULL) preempt_holder();
 		} else if (ret != 0) { /* Unrecoverable error */
 			errno = ret;
 			log_fatal("pthread_cond_timedwait()");
 		} else { /* ret == 0, someone signaled the condvar */
-			if (must_reset_timer) {
-				drop_lock_sent = 0;
-				continue;
-			} else { /* Spurious wakeup */
-				goto remainder;
-			}
+			if (must_reset_timer) continue;
+			else goto remainder; /* Spurious wakeup */
 		}
 	}
 }
@@ -406,7 +425,6 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 {
 	int newtq;
 	char id_str[HEX_STR_LEN(client->id)];
-	char *endptr;
 
 	client_id_as_string(id_str, sizeof(id_str), client->id);
 
@@ -471,10 +489,9 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 		log_info("Received %s from %s",
 			 message_type_string[in_msg->type], id_str);
 
-		errno = 0;
-		newtq = (int)strtoll(in_msg->data, &endptr, 0);
-        	if (in_msg->data != endptr && *endptr == '\0' && errno == 0) {
+		if (parse_tq(in_msg->data, &newtq) == 0) {
 			tq = newtq;
+			quantum_expired = 0;
 			must_reset_timer = 1;
 			pthread_cond_broadcast(&timer_cv); /* Reset timer on TQ change */
 			log_info("New TQ = %d", tq);
@@ -491,6 +508,9 @@ static void process_msg(struct nvshare_client *client, const struct message *in_
 			if (scheduler_on) {
 				insert_req(client);
 				if (!lock_held) try_schedule();
+				else if (quantum_expired && !drop_lock_sent &&
+					 requests->next != NULL)
+					preempt_holder();
 			}
 		} else { /* The client is not registered. Slam the door. */
 			delete_client(client);
@@ -528,7 +548,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	pthread_t timer_tid;
 	struct nvshare_client *client;
 	int ret, err, lsock, rsock, num_fds;
-	char *debug_val;
+	char *debug_val, *tq_val;
 	struct message in_msg = {0};
 	struct epoll_event event, events[EPOLL_MAX_EVENTS];
 
@@ -571,8 +591,12 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 
 	/* TODO: Enable setting this dynamically through an envvar/conffile */
 	scheduler_on = 1;
-	/* TODO: Enable setting this dynamically through an envvar/conffile */
 	tq = NVSHARE_DEFAULT_TQ;
+	tq_val = getenv(ENV_NVSHARE_TQ);
+	if (tq_val != NULL && parse_tq(tq_val, &tq) != 0)
+		log_fatal("%s must be a positive number of seconds, got '%s'",
+			  ENV_NVSHARE_TQ, tq_val);
+	log_info("TQ = %d", tq);
 
 	/* Seed srand() for generating client IDs */
 	srand((unsigned int)(time(NULL)));

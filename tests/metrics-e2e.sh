@@ -95,7 +95,7 @@ gcc -Wall -Wextra -Werror -I"$ROOT/src" "$ROOT/tests/fake-client.c" \
 
 mkdir -p /var/run/nvshare /var/lib/kubelet/device-plugins
 
-ASAN_OPTIONS=detect_leaks=0 "$WORK/nvshare-scheduler" > "$WORK/scheduler.log" 2>&1 &
+ASAN_OPTIONS=detect_leaks=0 NVSHARE_TQ=7 "$WORK/nvshare-scheduler" > "$WORK/scheduler.log" 2>&1 &
 SCHED_PID=$!
 PIDS+=("$SCHED_PID")
 start_device_plugin
@@ -103,6 +103,7 @@ for _ in $(seq 50); do
     grep -q "listening on" "$WORK/scheduler.log" && break
     sleep 0.1
 done
+grep -q "TQ = 7" "$WORK/scheduler.log"
 "$ROOT/src/nvsharectl" -T 2 > "$WORK/nvsharectl.log" 2>&1
 
 echo "== pod-a holds the lock, pod-b queues behind it"
@@ -151,6 +152,25 @@ expect_eq "$(sched clients)" 0
 expect_eq "$(sched metrics_dropped_total)" 0
 expect_eq "$(rejected version)" 0
 expect_eq "$(rejected malformed)" 0
+
+echo "== pod-d keeps the lock past the time quantum while nobody waits, and gives it up as soon as pod-e asks"
+"$WORK/fake-client" team-d pod-d 30 &
+D=$!
+sleep 3
+scrape
+expect_eq "$(pod lock_holding team-d pod-d)" 1
+expect_eq "$(pod lock_releases_total team-d pod-d quantum)" 0
+"$WORK/fake-client" team-e pod-e 1 &
+E=$!
+wait "$D" "$E"
+sleep 0.5
+scrape
+expect_between "$(pod lock_held_seconds_total team-d pod-d)" 2.9 3.9
+expect_eq "$(pod locks_acquired_total team-d pod-d)" 1
+expect_eq "$(pod lock_releases_total team-d pod-d quantum)" 1
+expect_between "$(pod lock_wait_seconds_total team-e pod-e)" 0 0.5
+expect_between "$(pod lock_held_seconds_total team-e pod-e)" 0.9 1.6
+expect_eq "$(pod lock_releases_total team-e pod-e idle)" 1
 
 echo "== only the owner can write to the metrics socket"
 mode=$(stat -c %a /var/run/nvshare/metrics.sock)
