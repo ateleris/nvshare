@@ -134,7 +134,9 @@ jobs:
     name: GPU sharing test
     needs: [c, gpu-test-image]
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, gpu]
+    runs-on:
+      group: GPU
+      labels: [self-hosted, gpu]
     timeout-minutes: 15
     steps:
       - name: Checkout repository
