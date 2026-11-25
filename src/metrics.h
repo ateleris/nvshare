@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include "nvshare_types.h"
 
-#define METRICS_SOCKET_PATH "/var/run/nvshare/metrics.sock"
 
 /*
  * Wire protocol version. Bump when any on-wire struct/enum changes. The Go

@@ -87,6 +87,16 @@ jobs:
       - name: Build Docker image
         run: docker build -f ${{ matrix.dockerfile }} .
 
+  client:
+    name: Client library test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run libnvshare against a fake CUDA driver
+        run: tests/client-e2e.sh
+
   metrics:
     name: Metrics end-to-end test
     runs-on: ubuntu-latest

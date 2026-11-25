@@ -59,6 +59,7 @@ static int try_connect_socket(void)
 {
 	int fd;
 	struct sockaddr_un addr;
+	const char *dir = nvshare_sock_dir();
 
 	fd = socket(AF_LOCAL, SOCK_DGRAM, 0);
 	if (fd < 0) {
@@ -75,16 +76,17 @@ static int try_connect_socket(void)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_LOCAL;
-	strlcpy(addr.sun_path, METRICS_SOCKET_PATH, sizeof(addr.sun_path));
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s%smetrics.sock", dir,
+		 dir[strlen(dir) - 1] == '/' ? "" : "/");
 
 	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-		log_debug("METRICS: Cannot connect to %s: %s", METRICS_SOCKET_PATH, strerror(errno));
+		log_debug("METRICS: Cannot connect to %s: %s", addr.sun_path, strerror(errno));
 		close(fd);
 		return -1;
 	}
 
 	socket_fd = fd;
-	log_info("METRICS: Connected to device plugin at %s", METRICS_SOCKET_PATH);
+	log_info("METRICS: Connected to device plugin at %s", addr.sun_path);
 	return 0;
 }
 

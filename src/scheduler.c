@@ -676,18 +676,22 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	 *    2. Can read meta-information (permissions, timestamps, size)
 	 *       about a file if the file name is known
 	 */
-	err = mkdir(NVSHARE_SOCK_DIR, S_IRWXU | S_IXGRP | S_IXOTH);
+	if (nvshare_get_scheduler_path(nvscheduler_socket_path) != 0)
+		log_fatal("The path of the scheduler socket in %s is too long",
+			  nvshare_sock_dir());
+
+	err = mkdir(nvshare_sock_dir(), S_IRWXU | S_IXGRP | S_IXOTH);
 	if (err != 0 && errno != EEXIST)
 		log_fatal("Could not create scheduler socket directory %s",
-			  NVSHARE_SOCK_DIR);
+			  nvshare_sock_dir());
 
 	/*
 	 * Unconditionally call chmod(), as it is not affected by umask, to
 	 * ensure that the directory has the correct (aforementioned) 711
 	 * permissions.
 	 */
-	if (chmod(NVSHARE_SOCK_DIR, S_IRWXU | S_IXGRP | S_IXOTH) != 0)
-		log_fatal("chmod() failed for %s", NVSHARE_SOCK_DIR);
+	if (chmod(nvshare_sock_dir(), S_IRWXU | S_IXGRP | S_IXOTH) != 0)
+		log_fatal("chmod() failed for %s", nvshare_sock_dir());
 
 	/* TODO: Enable setting this dynamically through an envvar/conffile */
 	scheduler_on = 1;
@@ -727,9 +731,6 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 		sig_fd = signalfd(-1, &mask, SFD_CLOEXEC);
 		true_or_exit(sig_fd >= 0);
 	}
-
-	if (nvshare_get_scheduler_path(nvscheduler_socket_path) != 0)
-		log_fatal("nvshare_get_scheduler_path() failed!");
 
 	/* Spawn the timer thread */
 	true_or_exit(pthread_create(&timer_tid, NULL, timer_thr_fn, NULL) == 0);

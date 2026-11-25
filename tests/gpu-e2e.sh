@@ -15,6 +15,8 @@ TQ=${TQ:-5}
 MIN_FREE_MIB=1024
 RESERVE_MIB=1536
 
+GRAPH=("" "" "--graph")
+
 LOGS=$(mktemp -d)
 SOCK=/var/run/nvshare/scheduler.sock
 SCHED_PID=
@@ -68,10 +70,10 @@ run() {
         exit 1
     fi
 
-    echo "running 2 workloads: $MEM_MIB MiB each, $seconds s, time quantum $TQ s"
+    echo "running 2 workloads: $MEM_MIB MiB each, $seconds s, time quantum $TQ s, the second with cuda graphs"
     for n in 1 2; do
         LD_PRELOAD="$BIN/libnvshare.so" "$BIN/gpu-test" \
-            --mem-mib "$MEM_MIB" --seconds "$seconds" > "$LOGS/workload-$n.log" 2>&1 &
+            --mem-mib "$MEM_MIB" --seconds "$seconds" ${GRAPH[n]} > "$LOGS/workload-$n.log" 2>&1 &
         PIDS[n]=$!
     done
     for n in 1 2; do
@@ -91,6 +93,9 @@ run() {
         [ "${RC[n]}" -eq 0 ] || fail "workload $n exited with ${RC[n]}"
         grep -q '^PASS$' "$log" || fail "workload $n did not report PASS"
         grep -q '^libnvshare loaded: yes' "$log" || fail "workload $n ran without libnvshare"
+        if grep -q "Can't hook" "$log"; then
+            fail "workload $n used a driver function that libnvshare cannot hook"
+        fi
         WAITS[n]=$(sed -n 's/^waited for the gpu: .* in \([0-9]*\) waits.*/\1/p' "$log")
     done
 

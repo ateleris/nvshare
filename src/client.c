@@ -36,6 +36,7 @@
 #include "cuda_defs.h"
 
 #define MEM_REPORT_STEP_MIB 64
+#define CAPTURE_WAIT_SEC 5
 
 void *client_fn(void *arg __attribute__((unused)));
 void *release_early_fn(void *arg __attribute__((unused)));
@@ -112,6 +113,22 @@ void report_mem_growth(void)
 	mib = allocated_mem_mib();
 	if (mib > reported_mem_mib) send_mem_usage(mib);
 	true_or_exit(pthread_mutex_unlock(&global_mutex) == 0);
+}
+
+
+static int wait_for_captures(void)
+{
+	struct timespec deadline;
+	int ret = 0;
+
+	true_or_exit(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+	deadline.tv_sec += CAPTURE_WAIT_SEC;
+	while (active_captures > 0 && own_lock == 1 && ret == 0)
+		ret = pthread_cond_timedwait(&capture_cv, &capture_mutex,
+					     &deadline);
+	true_or_exit(ret == 0 || ret == ETIMEDOUT);
+
+	return active_captures == 0;
 }
 
 
@@ -264,6 +281,7 @@ void *client_fn(void *arg __attribute__((unused)))
 	struct message out_msg;
 	CUresult cu_err = CUDA_SUCCESS;
 	size_t gpu_mib;
+	int captures_ended;
 
 	memset(&out_msg, 0, sizeof(out_msg));
 	out_msg.id = 1234;
@@ -362,11 +380,23 @@ void *client_fn(void *arg __attribute__((unused)))
 			log_debug("Received %s", message_type_string[in_msg.type]);
 
 			if (own_lock == 1) { /* Sanity check */
-				own_lock = 0; /* Block work submission */
-				cuda_sync_context(); /* Ensure all submitted work done */
-				out_msg.type = LOCK_RELEASED;
-				true_or_exit(write_whole(rsock, &out_msg, sizeof(out_msg)) == sizeof(out_msg));
-				log_debug("Sent %s", message_type_string[out_msg.type]);
+				true_or_exit(pthread_mutex_unlock(&global_mutex) == 0);
+				true_or_exit(pthread_mutex_lock(&capture_mutex) == 0);
+				captures_ended = wait_for_captures();
+				true_or_exit(pthread_mutex_lock(&global_mutex) == 0);
+				if (own_lock == 1) {
+					own_lock = 0; /* Block work submission */
+					if (captures_ended)
+						cuda_sync_context(); /* Ensure all submitted work done */
+					else log_warn("A stream capture is still"
+						      " open, releasing the GPU"
+						      " lock without waiting for"
+						      " submitted work");
+					out_msg.type = LOCK_RELEASED;
+					true_or_exit(write_whole(rsock, &out_msg, sizeof(out_msg)) == sizeof(out_msg));
+					log_debug("Sent %s", message_type_string[out_msg.type]);
+				}
+				true_or_exit(pthread_mutex_unlock(&capture_mutex) == 0);
 			}
 
 			break;
@@ -406,18 +436,78 @@ void *client_fn(void *arg __attribute__((unused)))
 }
 
 
+/*
+ * Called when the client has not submitted any new work to the GPU within
+ * the last interval.
+ *
+ * However, it could be the case that the client has already submitted enough
+ * work on the GPU to keep it busy and doesn't need to submit more for now.
+ *
+ * Since "doing work" means keeping the GPU busy, we use NVML to get the GPU
+ * utilization rate and deduce whether the client is actually idle or not.
+ *
+ * A busy GPU does not mean that we are the ones keeping it busy, as other
+ * clients can hold the lock at the same time as us. In that case, or if NVML
+ * fails, check our own CUDA context.
+ */
+static int is_idle(nvmlDevice_t nvml_dev)
+{
+	struct timespec cuda_sync_start_time = {0, 0};
+	struct timespec cuda_sync_complete_time = {0, 0};
+	struct timespec cuda_sync_duration = {0, 0};
+	unsigned int elapsed_ms;
+	nvmlReturn_t nvml_ret;
+	nvmlUtilization_t nvml_util;
+
+	if (nvml_ok) {
+		nvml_ret = real_nvmlDeviceGetUtilizationRates(nvml_dev, &nvml_util);
+		if (nvml_ret != NVML_SUCCESS) {
+			/*
+			 * Don't consider NVML failing a fatal thing.
+			 *
+			 * However, this is a bad thing to happen, because if
+			 * we've reached this point then we've found the NVML
+			 * symbols, which indicates a deeper error.
+			 */
+			log_warn("nvmlInit failed with %d", (int)nvml_ret);
+			nvml_ok = 0; /* Stop using NVML */
+			return 0;
+		}
+		log_debug("GPU Utilization = %u %%", nvml_util.gpu);
+		if (nvml_util.gpu == 0) return 1;
+	}
+
+	/*
+	 * The idea is the following:
+	 *
+	 * Check if cuCtxSynchronize() takes more than 100 ms.
+	 *
+	 * This is an empirical threshold above which we consider that we've
+	 * been doing work on the GPU for the past interval instead of being
+	 * idle.
+	 */
+	true_or_exit(clock_gettime(CLOCK_MONOTONIC, &cuda_sync_start_time) == 0);
+	cuda_sync_context();
+	true_or_exit(clock_gettime(CLOCK_MONOTONIC, &cuda_sync_complete_time) == 0);
+	timespecsub(&cuda_sync_complete_time, &cuda_sync_start_time, &cuda_sync_duration);
+
+	elapsed_ms = ((unsigned int)cuda_sync_duration.tv_sec * 1000)
+		     + (cuda_sync_duration.tv_nsec / 1000000);
+	if (elapsed_ms >= 100) {
+		log_debug("Early release timer elapsed but we are not idle");
+		return 0;
+	}
+	return 1;
+}
+
+
 void *release_early_fn(void *arg __attribute__((unused)))
 {
 	struct message release_msg = {0};
 	struct timespec timer_end_ts = {0, 0};
-	struct timespec cuda_sync_start_time = {0, 0};
-	struct timespec cuda_sync_complete_time = {0, 0};
-	struct timespec cuda_sync_duration = {0, 0};
-	int ret, busy;
-	unsigned int elapsed_ms;
+	int ret;
 	nvmlReturn_t nvml_ret;
 	nvmlDevice_t nvml_dev;
-	nvmlUtilization_t nvml_util;
 
 	release_msg.type = LOCK_RELEASED;
 	release_msg.id = nvshare_client_id;
@@ -462,76 +552,16 @@ wait_remainder:
 				did_work = 0;
 				continue;
 			}
-			/*
-			 * At this point, the client has not submitted any new
-			 * work to the GPU within the last interval.
-			 *
-			 * However, it could be the case that the client has
-			 * already submitted enough work on the GPU to keep it
-			 * busy and doesn't need to submit more for now.
-			 *
-			 * Since "doing work" means keeping the GPU busy, we
-			 * use NVML to get the GPU utilization rate and
-			 * deduce whether the client is actually idle or not.
-			 *
-			 * A busy GPU does not mean that we are the ones
-			 * keeping it busy, as other clients can hold the lock
-			 * at the same time as us. In that case, or if NVML
-			 * fails, check our own CUDA context.
-			 */
-			busy = 1;
-			if (nvml_ok) {
-				nvml_ret = real_nvmlDeviceGetUtilizationRates(nvml_dev, &nvml_util);
-				if (nvml_ret != NVML_SUCCESS) {
-					/*
-					 * Don't consider NVML failing a fatal
-					 * thing.
-					 *
-					 * However, this is a bad thing
-					 * to happen, because if we've
-					 * reached this point then we've found
-					 * the NVML symbols, which indicates a
-					 * deeper error.
-					 */
-					log_warn("nvmlInit failed with %d", (int)nvml_ret);
-					nvml_ok = 0; /* Stop using NVML */
-					continue;
-				}
-				log_debug("GPU Utilization = %u %%", nvml_util.gpu);
-				busy = nvml_util.gpu > 0;
+			if (pthread_mutex_trylock(&capture_mutex) != 0) continue;
+			if (active_captures == 0 && is_idle(nvml_dev)) {
+				/* IDLE */
+				log_debug("Releasing the lock early due to inactivity");
+				true_or_exit(write_whole(rsock, &release_msg, sizeof(release_msg)) == sizeof(release_msg));
+				own_lock = 0;
+				log_debug("Sent %s", message_type_string[release_msg.type]);
+				true_or_exit(pthread_cond_broadcast(&capture_cv) == 0);
 			}
-			if (busy) {
-				/*
-				 * The idea is the following:
-				 *
-				 * Check if cuCtxSynchronize() takes more than
-				 * 100 ms.
-				 *
-				 * This is an empirical threshold above
-				 * which we consider that we've been doing work
-				 * on the GPU for the past interval instead of
-				 * being idle.
-				 */
-				true_or_exit(clock_gettime(CLOCK_MONOTONIC,
-					&cuda_sync_start_time) == 0);
-				cuda_sync_context();
-				true_or_exit(clock_gettime(CLOCK_MONOTONIC,
-					&cuda_sync_complete_time) == 0);
-				timespecsub(&cuda_sync_complete_time, &cuda_sync_start_time, &cuda_sync_duration);
-
-				elapsed_ms = ((unsigned int)cuda_sync_duration.tv_sec * 1000)
-					     + (cuda_sync_duration.tv_nsec / 1000000);
-				if (elapsed_ms >= 100) {
-					log_debug("Early release timer elapsed but we are not idle");
-					continue;
-				}
-			}
-
-			/* IDLE */
-			log_debug("Releasing the lock early due to inactivity");
-			true_or_exit(write_whole(rsock, &release_msg, sizeof(release_msg)) == sizeof(release_msg));
-			own_lock = 0;
-			log_debug("Sent %s", message_type_string[release_msg.type]);
+			true_or_exit(pthread_mutex_unlock(&capture_mutex) == 0);
 		} else if (ret != 0) { /* BAD */
 			errno = ret;
 			log_fatal_errno("pthread_cond_timedwait() failed");
