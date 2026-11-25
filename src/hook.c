@@ -49,6 +49,10 @@
 #define KERN_SYNC_WINDOW_MAX 2048          /* Pending Kernels */
 
 static void *real_dlsym_225(void *handle, const char *symbol);
+static void load_cuda_symbols(void *cuda_handle);
+static void *hook_for_symbol(const char *symbol);
+static void *hook_for_proc(const char *symbol);
+static void *hook_for_real(void *fn);
 
 cuCtxSynchronize_func real_cuCtxSynchronize = NULL;
 cuLaunchKernel_func real_cuLaunchKernel = NULL;
@@ -74,6 +78,38 @@ cuGetErrorName_func real_cuGetErrorName = NULL;
 cuCtxSetCurrent_func real_cuCtxSetCurrent = NULL;
 cuCtxGetCurrent_func real_cuCtxGetCurrent = NULL;
 cuInit_func real_cuInit = NULL;
+
+static cuLaunchKernel_func real_cuLaunchKernel_ptsz = NULL;
+static cuMemcpy_func real_cuMemcpy_ptds = NULL;
+static cuMemcpyAsync_func real_cuMemcpyAsync_ptsz = NULL;
+static cuMemcpyDtoH_func real_cuMemcpyDtoH_v2_ptds = NULL;
+static cuMemcpyDtoHAsync_func real_cuMemcpyDtoHAsync_v2_ptsz = NULL;
+static cuMemcpyHtoD_func real_cuMemcpyHtoD_v2_ptds = NULL;
+static cuMemcpyHtoDAsync_func real_cuMemcpyHtoDAsync_v2_ptsz = NULL;
+static cuMemcpyDtoD_func real_cuMemcpyDtoD_v2_ptds = NULL;
+static cuMemcpyDtoDAsync_func real_cuMemcpyDtoDAsync_v2_ptsz = NULL;
+static cuLaunchKernelEx_func real_cuLaunchKernelEx = NULL;
+static cuLaunchKernelEx_func real_cuLaunchKernelEx_ptsz = NULL;
+static cuLaunchCooperativeKernel_func real_cuLaunchCooperativeKernel = NULL;
+static cuLaunchCooperativeKernel_func real_cuLaunchCooperativeKernel_ptsz = NULL;
+static cuGraphLaunch_func real_cuGraphLaunch = NULL;
+static cuGraphLaunch_func real_cuGraphLaunch_ptsz = NULL;
+static cuStreamBeginCapture_func real_cuStreamBeginCapture = NULL;
+static cuStreamBeginCapture_func real_cuStreamBeginCapture_ptsz = NULL;
+static cuStreamBeginCapture_v2_func real_cuStreamBeginCapture_v2 = NULL;
+static cuStreamBeginCapture_v2_func real_cuStreamBeginCapture_v2_ptsz = NULL;
+static cuStreamBeginCaptureToGraph_func real_cuStreamBeginCaptureToGraph = NULL;
+static cuStreamBeginCaptureToGraph_func real_cuStreamBeginCaptureToGraph_ptsz = NULL;
+static cuStreamEndCapture_func real_cuStreamEndCapture = NULL;
+static cuStreamEndCapture_func real_cuStreamEndCapture_ptsz = NULL;
+static cuStreamIsCapturing_func real_cuStreamIsCapturing = NULL;
+
+pthread_mutex_t capture_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t capture_cv = PTHREAD_COND_INITIALIZER;
+int active_captures = 0;
+
+static void *libcuda_handle = NULL;
+static void *libcuda_base = NULL;
 
 nvmlDeviceGetUtilizationRates_func real_nvmlDeviceGetUtilizationRates = NULL;
 nvmlInit_func real_nvmlInit = NULL;
@@ -110,6 +146,7 @@ static void bootstrap_cuda(void)
 	char *error;
 	void *cuda_handle;
 	void *nvml_handle;
+	Dl_info cuda_info;
 
 	true_or_exit(pthread_mutex_init(&kcount_mutex, NULL) == 0);
 
@@ -152,145 +189,12 @@ static void bootstrap_cuda(void)
 		error = dlerror();
 		log_fatal("%s", error);
 	}
-	/*
-	 * For dlsym(), a return value of NULL does not necessarily indicate
-	 * an error. Therefore, we must:
-	 *  1. clear the previous error state by calling dlerror()
-	 *  2. call dlsym()
-	 *  3. call dlerror()
-	 * If the value which dlerror() returns is not NULL, an error occured.
-	 */
-	dlerror();
-	real_cuMemAllocManaged = (cuMemAllocManaged_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemAllocManaged));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemFree = (cuMemFree_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemFree));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuGetProcAddress = (cuGetProcAddress_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuGetProcAddress));
-	error = dlerror();
-	if (error != NULL)
-		/*
-		 * Print a debug message instead of failing immediately, since
-		 * this symbol may not be used. This may be the case for CUDA
-		 * Runtime <11.3.
-		 */
-		log_debug("%s", error);
-	real_cuGetProcAddress_v2 = (cuGetProcAddress_v2_func)
-		real_dlsym_225(cuda_handle, CUDA_SYMBOL_STRING(cuGetProcAddress_v2));
-	error = dlerror();
-	if (error != NULL)
-		/*
-		 * Print a debug message instead of failing immediately, since
-		 * this symbol may not be used. This may be the case for CUDA
-		 * Runtime <12.0.
-		 */
-		log_debug("%s", error);
-	real_cuMemGetInfo = (cuMemGetInfo_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemGetInfo));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuDeviceGet = (cuDeviceGet_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuDeviceGet));
-	error = dlerror();
-	if (error != NULL)
-		log_debug("%s", error);
-	real_cuDeviceTotalMem = (cuDeviceTotalMem_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuDeviceTotalMem));
-	error = dlerror();
-	if (error != NULL)
-		log_debug("%s", error);
-	real_cuGetErrorString = (cuGetErrorString_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuGetErrorString));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuGetErrorName = (cuGetErrorString_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuGetErrorName));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuCtxSetCurrent = (cuCtxSetCurrent_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuCtxSetCurrent));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuCtxGetCurrent = (cuCtxGetCurrent_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuCtxGetCurrent));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuInit = (cuInit_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuInit));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuCtxSynchronize = (cuCtxSynchronize_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuCtxSynchronize));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuLaunchKernel = (cuLaunchKernel_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuLaunchKernel));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemcpy = (cuMemcpy_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemcpy));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemcpyAsync = (cuMemcpyAsync_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemcpyAsync));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemcpyDtoH = (cuMemcpyDtoH_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemcpyDtoH));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemcpyDtoHAsync = (cuMemcpyDtoHAsync_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemcpyDtoHAsync));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemcpyHtoD = (cuMemcpyHtoD_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemcpyHtoD));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemcpyHtoDAsync = (cuMemcpyHtoDAsync_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemcpyHtoDAsync));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemcpyDtoD = (cuMemcpyDtoD_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemcpyDtoD));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemcpyDtoDAsync = (cuMemcpyDtoDAsync_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemcpyDtoDAsync));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemAllocAsync = (cuMemAllocAsync_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemAllocAsync));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
-	real_cuMemFreeAsync = (cuMemFreeAsync_func)
-		real_dlsym_225(cuda_handle,CUDA_SYMBOL_STRING(cuMemFreeAsync));
-	error = dlerror();
-	if (error != NULL)
-		log_fatal("%s", error);
+	load_cuda_symbols(cuda_handle);
+
+	if (dladdr((void *)real_cuInit, &cuda_info) == 0)
+		log_fatal("dladdr() failed for the real cuInit");
+	libcuda_handle = cuda_handle;
+	libcuda_base = cuda_info.dli_fbase;
 }
 
 
@@ -365,10 +269,12 @@ static void initialize_libnvshare(void)
 void cuda_driver_check_error(CUresult err, const char *func_name)
 {
 	if (err != CUDA_SUCCESS) {
-		const char *err_string;
-		const char *err_name;
-		real_cuGetErrorString(err, &err_string);
-		real_cuGetErrorName(err, &err_name);
+		const char *err_string = "unknown";
+		const char *err_name = "unknown";
+		if (real_cuGetErrorString(err, &err_string) != CUDA_SUCCESS)
+			err_string = "unknown";
+		if (real_cuGetErrorName(err, &err_name) != CUDA_SUCCESS)
+			err_name = "unknown";
 		log_warn("%s returned %s: %s",
 	                 func_name, err_name, err_string);
 	}
@@ -461,98 +367,39 @@ static void *real_dlsym_234(void *handle, const char *symbol)
  * In all other cases, call the real dlsym() from glibc and pass on the
  * requested symbol string.
  */
+static int called_from_libcuda(const void *caller)
+{
+	Dl_info info;
+
+	if (libcuda_base == NULL || dladdr(caller, &info) == 0)
+		return 0;
+	return info.dli_fbase == libcuda_base;
+}
+
 void *dlsym_225(void *handle, const char *symbol)
 {
-	if (strncmp(symbol, "cu", 2) != 0) {
+	void *hook = hook_for_symbol(symbol);
+
+	if (hook == NULL)
 		return (real_dlsym_225(handle, symbol));
-	} 
-	
+
 	log_debug("dlsym_225 for symbol %s requested", symbol);
-
-	if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAlloc)) == 0) {
-		return (void *)(&cuMemAlloc);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFree)) == 0) {
-		return (void *)(&cuMemFree);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemGetInfo)) == 0) {
-		return (void *)(&cuMemGetInfo);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuGetProcAddress)) == 0) {
-		return (void *)(&cuGetProcAddress);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuGetProcAddress_v2)) == 0) {
-		return (void *)(&cuGetProcAddress_v2);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuInit)) == 0) {
-		return (void *)(&cuInit);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuLaunchKernel)) == 0) {
-		return (void *)(&cuLaunchKernel);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpy)) == 0) {
-		return (void *)(&cuMemcpy);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyAsync)) == 0) {
-		return (void *)(&cuMemcpyAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoH)) == 0) {
-		return (void *)(&cuMemcpyDtoH);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoHAsync)) == 0) {
-		return (void *)(&cuMemcpyDtoHAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyHtoD)) == 0) {
-		return (void *)(&cuMemcpyHtoD);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyHtoDAsync)) == 0) {
-		return (void *)(&cuMemcpyHtoDAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoD)) == 0) {
-		return (void *)(&cuMemcpyDtoD);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoDAsync)) == 0) {
-		return (void *)(&cuMemcpyDtoDAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAllocAsync)) == 0) {
-		return (void *)(&cuMemAllocAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFreeAsync)) == 0) {
-		return (void *)(&cuMemFreeAsync);
-	}
-
-	return (real_dlsym_225(handle, symbol));
+	if (called_from_libcuda(__builtin_return_address(0)))
+		return (real_dlsym_225(libcuda_handle, symbol));
+	return hook;
 }
 
 void *dlsym_234(void *handle, const char *symbol)
 {
-	if (strncmp(symbol, "cu", 2) != 0) {
+	void *hook = hook_for_symbol(symbol);
+
+	if (hook == NULL)
 		return (real_dlsym_234(handle, symbol));
-	} 
-	
+
 	log_debug("dlsym_234 for symbol %s requested", symbol);
-
-	if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAlloc)) == 0) {
-		return (void *)(&cuMemAlloc);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFree)) == 0) {
-		return (void *)(&cuMemFree);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemGetInfo)) == 0) {
-		return (void *)(&cuMemGetInfo);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuGetProcAddress)) == 0) {
-		return (void *)(&cuGetProcAddress);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuGetProcAddress_v2)) == 0) {
-		return (void *)(&cuGetProcAddress_v2);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuInit)) == 0) {
-		return (void *)(&cuInit);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuLaunchKernel)) == 0) {
-		return (void *)(&cuLaunchKernel);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpy)) == 0) {
-		return (void *)(&cuMemcpy);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyAsync)) == 0) {
-		return (void *)(&cuMemcpyAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoH)) == 0) {
-		return (void *)(&cuMemcpyDtoH);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoHAsync)) == 0) {
-		return (void *)(&cuMemcpyDtoHAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyHtoD)) == 0) {
-		return (void *)(&cuMemcpyHtoD);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyHtoDAsync)) == 0) {
-		return (void *)(&cuMemcpyHtoDAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoD)) == 0) {
-		return (void *)(&cuMemcpyDtoD);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemcpyDtoDAsync)) == 0) {
-		return (void *)(&cuMemcpyDtoDAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAllocAsync)) == 0) {
-		return (void *)(&cuMemAllocAsync);
-	} else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFreeAsync)) == 0) {
-		return (void *)(&cuMemFreeAsync);
-	}
-
-	return (real_dlsym_234(handle, symbol));
+	if (called_from_libcuda(__builtin_return_address(0)))
+		return (real_dlsym_234(libcuda_handle, symbol));
+	return hook;
 }
 
 
@@ -572,8 +419,40 @@ void *dlsym_234(void *handle, const char *symbol)
  *
  * Interpose both, to cover all cases.
  *
- * The logic is the same as when interposing dlsym().
+ * The driver picks the variant of a function from cudaVersion and flags, so
+ * we return our version of the function it picked.
  */
+static void *get_proc_address_hook(int cudaVersion, cuuint64_t flags)
+{
+	void *fn = NULL;
+
+	if (real_cuGetProcAddress_v2 != NULL)
+		real_cuGetProcAddress_v2("cuGetProcAddress", &fn, cudaVersion,
+					 flags, NULL);
+	if (fn != NULL && fn == (void *)real_cuGetProcAddress_v2)
+		return (void *)(&cuGetProcAddress_v2);
+	return (void *)(&cuGetProcAddress);
+}
+
+static CUresult hook_proc(const char *symbol, void **pfn, CUresult result)
+{
+	void *hook = NULL;
+
+	if (result == CUDA_SUCCESS && *pfn != NULL)
+		hook = hook_for_real(*pfn);
+	if (hook == NULL)
+		hook = hook_for_proc(symbol);
+	if (hook != NULL) {
+		*pfn = hook;
+		return CUDA_SUCCESS;
+	}
+	if (result == CUDA_SUCCESS && *pfn != NULL &&
+	    hook_for_symbol(symbol) != NULL)
+		log_warn("Can't hook %s, its work may break or bypass nvshare",
+			 symbol);
+	return result;
+}
+
 CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
 	cuuint64_t flags)
 {
@@ -592,42 +471,13 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
 
 	if (real_cuGetProcAddress == NULL) return CUDA_ERROR_NOT_INITIALIZED;
 
-	if (strcmp(symbol, "cuMemAlloc") == 0) {
-		*pfn = (void *)(&cuMemAlloc);
-	} else if (strcmp(symbol, "cuMemFree") == 0) {
-		*pfn = (void *)(&cuMemFree);
-	} else if (strcmp(symbol, "cuMemGetInfo") == 0) {
-		*pfn = (void *)(&cuMemGetInfo);
-	} else if (strcmp(symbol, "cuGetProcAddress") == 0) {
-		*pfn = (void *)(&cuGetProcAddress);
+	if (strcmp(symbol, "cuGetProcAddress") == 0) {
+		*pfn = get_proc_address_hook(cudaVersion, flags);
 	} else if (strcmp(symbol, "cuGetProcAddress_v2") == 0) {
 		*pfn = (void *)(&cuGetProcAddress_v2);
-	} else if (strcmp(symbol, "cuInit") == 0) {
-		*pfn = (void *)(&cuInit);
-	} else if (strcmp(symbol, "cuLaunchKernel") == 0) {
-		*pfn = (void *)(&cuLaunchKernel);
-	} else if (strcmp(symbol, "cuMemcpy") == 0) {
-		*pfn = (void *)(&cuMemcpy);
-	} else if (strcmp(symbol, "cuMemcpyAsync") == 0) {
-		*pfn = (void *)(&cuMemcpyAsync);
-	} else if (strcmp(symbol, "cuMemcpyDtoH") == 0) {
-		*pfn = (void *)(&cuMemcpyDtoH);
-	} else if (strcmp(symbol, "cuMemcpyDtoHAsync") == 0) {
-		*pfn = (void *)(&cuMemcpyDtoHAsync);
-	} else if (strcmp(symbol, "cuMemcpyHtoD") == 0) {
-		*pfn = (void *)(&cuMemcpyHtoD);
-	} else if (strcmp(symbol, "cuMemcpyHtoDAsync") == 0) {
-		*pfn = (void *)(&cuMemcpyHtoDAsync);
-	} else if (strcmp(symbol, "cuMemcpyDtoD") == 0) {
-		*pfn = (void *)(&cuMemcpyDtoD);
-	} else if (strcmp(symbol, "cuMemcpyDtoDAsync") == 0) {
-		*pfn = (void *)(&cuMemcpyDtoDAsync);
-	} else if (strcmp(symbol, "cuMemAllocAsync") == 0) {
-		*pfn = (void *)(&cuMemAllocAsync);
-	} else if (strcmp(symbol, "cuMemFreeAsync") == 0) {
-		*pfn = (void *)(&cuMemFreeAsync);
 	} else {
 		result = real_cuGetProcAddress(symbol, pfn, cudaVersion, flags);
+		result = hook_proc(symbol, pfn, result);
 	}
 
 	return result;
@@ -659,43 +509,16 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
 	if (symbolStatus != NULL)
 		*symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
 
-	if (strcmp(symbol, "cuMemAlloc") == 0) {
-		*pfn = (void *)(&cuMemAlloc);
-	} else if (strcmp(symbol, "cuMemFree") == 0) {
-		*pfn = (void *)(&cuMemFree);
-	} else if (strcmp(symbol, "cuMemGetInfo") == 0) {
-		*pfn = (void *)(&cuMemGetInfo);
-	} else if (strcmp(symbol, "cuGetProcAddress") == 0) {
-		*pfn = (void *)(&cuGetProcAddress);
+	if (strcmp(symbol, "cuGetProcAddress") == 0) {
+		*pfn = get_proc_address_hook(cudaVersion, flags);
 	} else if (strcmp(symbol, "cuGetProcAddress_v2") == 0) {
 		*pfn = (void *)(&cuGetProcAddress_v2);
-	} else if (strcmp(symbol, "cuInit") == 0) {
-		*pfn = (void *)(&cuInit);
-	} else if (strcmp(symbol, "cuLaunchKernel") == 0) {
-		*pfn = (void *)(&cuLaunchKernel);
-	} else if (strcmp(symbol, "cuMemcpy") == 0) {
-		*pfn = (void *)(&cuMemcpy);
-	} else if (strcmp(symbol, "cuMemcpyAsync") == 0) {
-		*pfn = (void *)(&cuMemcpyAsync);
-	} else if (strcmp(symbol, "cuMemcpyDtoH") == 0) {
-		*pfn = (void *)(&cuMemcpyDtoH);
-	} else if (strcmp(symbol, "cuMemcpyDtoHAsync") == 0) {
-		*pfn = (void *)(&cuMemcpyDtoHAsync);
-	} else if (strcmp(symbol, "cuMemcpyHtoD") == 0) {
-		*pfn = (void *)(&cuMemcpyHtoD);
-	} else if (strcmp(symbol, "cuMemcpyHtoDAsync") == 0) {
-		*pfn = (void *)(&cuMemcpyHtoDAsync);
-	} else if (strcmp(symbol, "cuMemcpyDtoD") == 0) {
-		*pfn = (void *)(&cuMemcpyDtoD);
-	} else if (strcmp(symbol, "cuMemcpyDtoDAsync") == 0) {
-		*pfn = (void *)(&cuMemcpyDtoDAsync);
-	} else if (strcmp(symbol, "cuMemAllocAsync") == 0) {
-		*pfn = (void *)(&cuMemAllocAsync);
-	} else if (strcmp(symbol, "cuMemFreeAsync") == 0) {
-		*pfn = (void *)(&cuMemFreeAsync);
 	} else {
 		result = real_cuGetProcAddress_v2(symbol, pfn, cudaVersion,
 					flags, symbolStatus);
+		result = hook_proc(symbol, pfn, result);
+		if (result == CUDA_SUCCESS && *pfn != NULL && symbolStatus != NULL)
+			*symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
 	}
 
 	return result;
@@ -828,22 +651,22 @@ CUresult cuInit(unsigned int flags)
 }
 
 
-CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX,
-	unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
-	unsigned int blockDimY, unsigned int blockDimZ,
-	unsigned int sharedMemBytes, CUstream hStream, void **kernelParams,
-	void **extra)
+static int stream_is_capturing(CUstream hStream)
 {
-	log_debug("cuLaunchKernel requested");
+	CUstreamCaptureStatus status;
+
+	if (__atomic_load_n(&active_captures, __ATOMIC_ACQUIRE) == 0 ||
+	    real_cuStreamIsCapturing == NULL)
+		return 0;
+	if (real_cuStreamIsCapturing(hStream, &status) != CUDA_SUCCESS)
+		return 0;
+	return status != CU_STREAM_CAPTURE_STATUS_NONE;
+}
+
+
+static void count_launch(void)
+{
 	CUresult result = CUDA_SUCCESS;
-
-	/* Return immediately if not initialized */
-	if (real_cuLaunchKernel == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-	result = real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX,
-		blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuLaunchKernel));
 
 	true_or_exit(pthread_mutex_lock(&kcount_mutex) == 0);
 
@@ -866,7 +689,8 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX,
 	 * trying to maintain a good throughput rate for smaller kernels.
 	 */
 	kern_since_sync++;
-	if (kern_since_sync >= pending_kernel_window) {
+	true_or_exit(pthread_mutex_lock(&capture_mutex) == 0);
+	if (kern_since_sync >= pending_kernel_window && active_captures == 0) {
 		struct timespec cuda_cuda_sync_start_time = {0, 0};
 		struct timespec cuda_sync_complete_time = {0, 0};
 		struct timespec cuda_sync_duration = {0, 0};
@@ -900,9 +724,253 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX,
 		log_debug("Pending Kernel Window is %d.", pending_kernel_window);
 		kern_since_sync = 0;
 	}
+	true_or_exit(pthread_mutex_unlock(&capture_mutex) == 0);
 
 	true_or_exit(pthread_mutex_unlock(&kcount_mutex) == 0);
+}
+
+
+static CUresult launch_kernel(cuLaunchKernel_func real, const char *name,
+	CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+	unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
+	unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream,
+	void **kernelParams, void **extra, CUstream stream)
+{
+	CUresult result = CUDA_SUCCESS;
+	int captured;
+
+	log_debug("%s requested", name);
+
+	/* Return immediately if not initialized */
+	if (real == NULL) return CUDA_ERROR_NOT_INITIALIZED;
+
+	captured = stream_is_capturing(stream);
+	if (!captured) continue_with_lock();
+	result = real(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY,
+		blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+	cuda_driver_check_error(result, name);
+	if (!captured) count_launch();
+
 	return result;
+}
+
+CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX,
+	unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
+	unsigned int blockDimY, unsigned int blockDimZ,
+	unsigned int sharedMemBytes, CUstream hStream, void **kernelParams,
+	void **extra)
+{
+	return launch_kernel(real_cuLaunchKernel, "cuLaunchKernel", f,
+		gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+		sharedMemBytes, hStream, kernelParams, extra, hStream);
+}
+
+CUresult cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX,
+	unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
+	unsigned int blockDimY, unsigned int blockDimZ,
+	unsigned int sharedMemBytes, CUstream hStream, void **kernelParams,
+	void **extra)
+{
+	return launch_kernel(real_cuLaunchKernel_ptsz, "cuLaunchKernel_ptsz", f,
+		gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+		sharedMemBytes, hStream, kernelParams, extra,
+		hStream ? hStream : CU_STREAM_PER_THREAD);
+}
+
+
+static CUresult launch_kernel_ex(cuLaunchKernelEx_func real, const char *name,
+	const CUlaunchConfig *config, CUfunction f, void **kernelParams,
+	void **extra, CUstream stream)
+{
+	CUresult result = CUDA_SUCCESS;
+	int captured;
+
+	log_debug("%s requested", name);
+	if (real == NULL) return CUDA_ERROR_NOT_INITIALIZED;
+
+	captured = stream_is_capturing(stream);
+	if (!captured) continue_with_lock();
+	result = real(config, f, kernelParams, extra);
+	cuda_driver_check_error(result, name);
+	if (!captured) count_launch();
+
+	return result;
+}
+
+CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+	void **kernelParams, void **extra)
+{
+	return launch_kernel_ex(real_cuLaunchKernelEx, "cuLaunchKernelEx",
+		config, f, kernelParams, extra, config ? config->hStream : NULL);
+}
+
+CUresult cuLaunchKernelEx_ptsz(const CUlaunchConfig *config, CUfunction f,
+	void **kernelParams, void **extra)
+{
+	CUstream hStream = config ? config->hStream : NULL;
+
+	return launch_kernel_ex(real_cuLaunchKernelEx_ptsz,
+		"cuLaunchKernelEx_ptsz", config, f, kernelParams, extra,
+		hStream ? hStream : CU_STREAM_PER_THREAD);
+}
+
+
+static CUresult launch_cooperative_kernel(cuLaunchCooperativeKernel_func real,
+	const char *name, CUfunction f, unsigned int gridDimX,
+	unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
+	unsigned int blockDimY, unsigned int blockDimZ,
+	unsigned int sharedMemBytes, CUstream hStream, void **kernelParams,
+	CUstream stream)
+{
+	CUresult result = CUDA_SUCCESS;
+	int captured;
+
+	log_debug("%s requested", name);
+	if (real == NULL) return CUDA_ERROR_NOT_INITIALIZED;
+
+	captured = stream_is_capturing(stream);
+	if (!captured) continue_with_lock();
+	result = real(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY,
+		blockDimZ, sharedMemBytes, hStream, kernelParams);
+	cuda_driver_check_error(result, name);
+	if (!captured) count_launch();
+
+	return result;
+}
+
+CUresult cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
+	unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
+	unsigned int blockDimY, unsigned int blockDimZ,
+	unsigned int sharedMemBytes, CUstream hStream, void **kernelParams)
+{
+	return launch_cooperative_kernel(real_cuLaunchCooperativeKernel,
+		"cuLaunchCooperativeKernel", f, gridDimX, gridDimY, gridDimZ,
+		blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream,
+		kernelParams, hStream);
+}
+
+CUresult cuLaunchCooperativeKernel_ptsz(CUfunction f, unsigned int gridDimX,
+	unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
+	unsigned int blockDimY, unsigned int blockDimZ,
+	unsigned int sharedMemBytes, CUstream hStream, void **kernelParams)
+{
+	return launch_cooperative_kernel(real_cuLaunchCooperativeKernel_ptsz,
+		"cuLaunchCooperativeKernel_ptsz", f, gridDimX, gridDimY,
+		gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes,
+		hStream, kernelParams, hStream ? hStream : CU_STREAM_PER_THREAD);
+}
+
+
+static CUresult launch_graph(cuGraphLaunch_func real, const char *name,
+	CUgraphExec hGraphExec, CUstream hStream, CUstream stream)
+{
+	CUresult result = CUDA_SUCCESS;
+	int captured;
+
+	log_debug("%s requested", name);
+	if (real == NULL) return CUDA_ERROR_NOT_INITIALIZED;
+
+	captured = stream_is_capturing(stream);
+	if (!captured) continue_with_lock();
+	result = real(hGraphExec, hStream);
+	cuda_driver_check_error(result, name);
+	if (!captured) count_launch();
+
+	return result;
+}
+
+CUresult cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream)
+{
+	return launch_graph(real_cuGraphLaunch, "cuGraphLaunch", hGraphExec,
+		hStream, hStream);
+}
+
+CUresult cuGraphLaunch_ptsz(CUgraphExec hGraphExec, CUstream hStream)
+{
+	return launch_graph(real_cuGraphLaunch_ptsz, "cuGraphLaunch_ptsz",
+		hGraphExec, hStream, hStream ? hStream : CU_STREAM_PER_THREAD);
+}
+
+
+#define BEGIN_CAPTURE(name, params, args)                                  \
+CUresult name params                                                       \
+{                                                                          \
+	CUresult result = CUDA_SUCCESS;                                    \
+                                                                           \
+	log_debug(#name " requested");                                     \
+	if (real_##name == NULL) return CUDA_ERROR_NOT_INITIALIZED;        \
+                                                                           \
+	true_or_exit(pthread_mutex_lock(&capture_mutex) == 0);             \
+	result = real_##name args;                                         \
+	if (result == CUDA_SUCCESS)                                        \
+		__atomic_add_fetch(&active_captures, 1, __ATOMIC_RELEASE); \
+	true_or_exit(pthread_mutex_unlock(&capture_mutex) == 0);           \
+                                                                           \
+	return result;                                                     \
+}
+
+BEGIN_CAPTURE(cuStreamBeginCapture, (CUstream hStream), (hStream))
+BEGIN_CAPTURE(cuStreamBeginCapture_ptsz, (CUstream hStream), (hStream))
+BEGIN_CAPTURE(cuStreamBeginCapture_v2,
+	(CUstream hStream, CUstreamCaptureMode mode), (hStream, mode))
+BEGIN_CAPTURE(cuStreamBeginCapture_v2_ptsz,
+	(CUstream hStream, CUstreamCaptureMode mode), (hStream, mode))
+BEGIN_CAPTURE(cuStreamBeginCaptureToGraph,
+	(CUstream hStream, CUgraph hGraph, const CUgraphNode *dependencies,
+	 const CUgraphEdgeData *dependencyData, size_t numDependencies,
+	 CUstreamCaptureMode mode),
+	(hStream, hGraph, dependencies, dependencyData, numDependencies, mode))
+BEGIN_CAPTURE(cuStreamBeginCaptureToGraph_ptsz,
+	(CUstream hStream, CUgraph hGraph, const CUgraphNode *dependencies,
+	 const CUgraphEdgeData *dependencyData, size_t numDependencies,
+	 CUstreamCaptureMode mode),
+	(hStream, hGraph, dependencies, dependencyData, numDependencies, mode))
+
+
+static CUresult end_capture(cuStreamEndCapture_func real, const char *name,
+	CUstream hStream, CUgraph *phGraph, CUstream stream)
+{
+	CUstreamCaptureStatus before, after;
+	CUresult result = CUDA_SUCCESS;
+	int ended;
+
+	log_debug("%s requested", name);
+	if (real == NULL) return CUDA_ERROR_NOT_INITIALIZED;
+
+	true_or_exit(pthread_mutex_lock(&capture_mutex) == 0);
+	if (real_cuStreamIsCapturing == NULL) {
+		result = real(hStream, phGraph);
+		ended = (result == CUDA_SUCCESS ||
+			 result == CUDA_ERROR_STREAM_CAPTURE_INVALIDATED);
+	} else {
+		if (real_cuStreamIsCapturing(stream, &before) != CUDA_SUCCESS)
+			before = CU_STREAM_CAPTURE_STATUS_NONE;
+		result = real(hStream, phGraph);
+		if (real_cuStreamIsCapturing(stream, &after) != CUDA_SUCCESS)
+			after = CU_STREAM_CAPTURE_STATUS_NONE;
+		ended = (before != CU_STREAM_CAPTURE_STATUS_NONE &&
+			 after == CU_STREAM_CAPTURE_STATUS_NONE);
+	}
+	if (ended && active_captures > 0) {
+		__atomic_sub_fetch(&active_captures, 1, __ATOMIC_RELEASE);
+		true_or_exit(pthread_cond_broadcast(&capture_cv) == 0);
+	}
+	true_or_exit(pthread_mutex_unlock(&capture_mutex) == 0);
+
+	return result;
+}
+
+CUresult cuStreamEndCapture(CUstream hStream, CUgraph *phGraph)
+{
+	return end_capture(real_cuStreamEndCapture, "cuStreamEndCapture",
+		hStream, phGraph, hStream);
+}
+
+CUresult cuStreamEndCapture_ptsz(CUstream hStream, CUgraph *phGraph)
+{
+	return end_capture(real_cuStreamEndCapture_ptsz,
+		"cuStreamEndCapture_ptsz", hStream, phGraph,
+		hStream ? hStream : CU_STREAM_PER_THREAD);
 }
 
 
@@ -910,139 +978,65 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX,
  * Memory copy functions can affect the resident pages on GPU, so we must
  * block them as well when the client doesn't have the GPU lock.
  */
-CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount)
-{
-	log_debug("cuMemcpy requested %zu bytes", ByteCount);
-	CUresult result = CUDA_SUCCESS;
-
-
-	if (real_cuMemcpy == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-
-	result = real_cuMemcpy(dst, src, ByteCount);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpy));
-
-	return result;
+#define GATED_COPY(name, params, args)                                \
+CUresult name params                                                  \
+{                                                                     \
+	CUresult result = CUDA_SUCCESS;                               \
+                                                                      \
+	log_debug(#name " requested %zu bytes", ByteCount);           \
+                                                                      \
+	/* Return immediately if not initialized */                   \
+	if (real_##name == NULL) return CUDA_ERROR_NOT_INITIALIZED;   \
+                                                                      \
+	continue_with_lock();                                         \
+	result = real_##name args;                                    \
+	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(name));    \
+                                                                      \
+	return result;                                                \
 }
 
-CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount,
-	CUstream hStream)
-{
-	log_debug("cuMemcpyAsync requested %zu bytes", ByteCount);
-	CUresult result = CUDA_SUCCESS;
+#define COPY_PARAMS (CUdeviceptr dst, CUdeviceptr src, size_t ByteCount)
+#define COPY_ARGS (dst, src, ByteCount)
+#define COPY_ASYNC_PARAMS \
+	(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream)
+#define COPY_ASYNC_ARGS (dst, src, ByteCount, hStream)
+#define DTOH_PARAMS (void *dstHost, CUdeviceptr srcDevice, size_t ByteCount)
+#define DTOH_ARGS (dstHost, srcDevice, ByteCount)
+#define DTOH_ASYNC_PARAMS \
+	(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream)
+#define DTOH_ASYNC_ARGS (dstHost, srcDevice, ByteCount, hStream)
+#define HTOD_PARAMS \
+	(CUdeviceptr dstDevice, const void *srcHost, size_t ByteCount)
+#define HTOD_ARGS (dstDevice, srcHost, ByteCount)
+#define HTOD_ASYNC_PARAMS \
+	(CUdeviceptr dstDevice, const void *srcHost, size_t ByteCount, \
+	 CUstream hStream)
+#define HTOD_ASYNC_ARGS (dstDevice, srcHost, ByteCount, hStream)
+#define DTOD_PARAMS \
+	(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount)
+#define DTOD_ARGS (dstDevice, srcDevice, ByteCount)
+#define DTOD_ASYNC_PARAMS \
+	(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount, \
+	 CUstream hStream)
+#define DTOD_ASYNC_ARGS (dstDevice, srcDevice, ByteCount, hStream)
 
+GATED_COPY(cuMemcpy, COPY_PARAMS, COPY_ARGS)
+GATED_COPY(cuMemcpyAsync, COPY_ASYNC_PARAMS, COPY_ASYNC_ARGS)
+GATED_COPY(cuMemcpyDtoH, DTOH_PARAMS, DTOH_ARGS)
+GATED_COPY(cuMemcpyDtoHAsync, DTOH_ASYNC_PARAMS, DTOH_ASYNC_ARGS)
+GATED_COPY(cuMemcpyHtoD, HTOD_PARAMS, HTOD_ARGS)
+GATED_COPY(cuMemcpyHtoDAsync, HTOD_ASYNC_PARAMS, HTOD_ASYNC_ARGS)
+GATED_COPY(cuMemcpyDtoD, DTOD_PARAMS, DTOD_ARGS)
+GATED_COPY(cuMemcpyDtoDAsync, DTOD_ASYNC_PARAMS, DTOD_ASYNC_ARGS)
 
-	if (real_cuMemcpyAsync == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-
-	result = real_cuMemcpyAsync(dst, src, ByteCount, hStream);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpyAsync));
-
-	return result;
-}
-
-CUresult cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount)
-{
-	log_debug("cuMemcpyDtoH requested %zu bytes", ByteCount);
-	CUresult result = CUDA_SUCCESS;
-
-
-	/* Return immediately if not initialized */
-	if (real_cuMemcpyDtoH == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-	result = real_cuMemcpyDtoH(dstHost, srcDevice, ByteCount);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpyDtoH));
-
-	return result;
-}
-
-CUresult cuMemcpyDtoHAsync(void* dstHost, CUdeviceptr srcDevice,
-	size_t ByteCount, CUstream hStream)
-{
-	log_debug("cuMemcpyDtoHAsync requested %zu bytes", ByteCount);
-	CUresult result = CUDA_SUCCESS;
-
-
-	/* Return immediately if not initialized */
-	if (real_cuMemcpyDtoHAsync == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-	result = real_cuMemcpyDtoHAsync(dstHost, srcDevice, ByteCount, hStream);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpyDtoHAsync));
-
-	return result;
-}
-
-CUresult cuMemcpyHtoD(CUdeviceptr dstDevice, const void* srcHost,
-	size_t ByteCount)
-{
-	log_debug("cuMemcpyHtoD requested %zu bytes", ByteCount);
-	CUresult result = CUDA_SUCCESS;
-
-
-	/* Return immediately if not initialized */
-	if (real_cuMemcpyHtoD == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-	result = real_cuMemcpyHtoD(dstDevice, srcHost, ByteCount);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpyHtoD));
-
-	return result;
-}
-
-CUresult cuMemcpyHtoDAsync(CUdeviceptr dstDevice, const void* srcHost,
-	size_t ByteCount, CUstream hStream)
-{
-	log_debug("cuMemcpyHtoDAsync requested %zu bytes", ByteCount);
-	CUresult result = CUDA_SUCCESS;
-
-
-	/* Return immediately if not initialized */
-	if (real_cuMemcpyHtoDAsync == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-	result = real_cuMemcpyHtoDAsync(dstDevice, srcHost, ByteCount, hStream);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpyHtoDAsync));
-
-	return result;
-}
-
-CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
-	size_t ByteCount)
-{
-	log_debug("cuMemcpyDtoD requested %zu bytes", ByteCount);
-	CUresult result = CUDA_SUCCESS;
-
-
-	/* Return immediately if not initialized */
-	if (real_cuMemcpyDtoD == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-	result = real_cuMemcpyDtoD(dstDevice, srcDevice, ByteCount);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpyDtoD));
-
-	return result;
-}
-
-CUresult cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
-	size_t ByteCount, CUstream hStream)
-{
-	log_debug("cuMemcpyDtoDAsync requested %zu bytes", ByteCount);
-	CUresult result = CUDA_SUCCESS;
-
-
-	/* Return immediately if not initialized */
-	if (real_cuMemcpyDtoDAsync == NULL) return CUDA_ERROR_NOT_INITIALIZED;
-
-	continue_with_lock();
-	result = real_cuMemcpyDtoDAsync(dstDevice, srcDevice, ByteCount, hStream);
-	cuda_driver_check_error(result, CUDA_SYMBOL_STRING(cuMemcpyDtoDAsync));
-
-	return result;
-}
+GATED_COPY(cuMemcpy_ptds, COPY_PARAMS, COPY_ARGS)
+GATED_COPY(cuMemcpyAsync_ptsz, COPY_ASYNC_PARAMS, COPY_ASYNC_ARGS)
+GATED_COPY(cuMemcpyDtoH_v2_ptds, DTOH_PARAMS, DTOH_ARGS)
+GATED_COPY(cuMemcpyDtoHAsync_v2_ptsz, DTOH_ASYNC_PARAMS, DTOH_ASYNC_ARGS)
+GATED_COPY(cuMemcpyHtoD_v2_ptds, HTOD_PARAMS, HTOD_ARGS)
+GATED_COPY(cuMemcpyHtoDAsync_v2_ptsz, HTOD_ASYNC_PARAMS, HTOD_ASYNC_ARGS)
+GATED_COPY(cuMemcpyDtoD_v2_ptds, DTOD_PARAMS, DTOD_ARGS)
+GATED_COPY(cuMemcpyDtoDAsync_v2_ptsz, DTOD_ASYNC_PARAMS, DTOD_ASYNC_ARGS)
 
 CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize,
 	CUstream hStream __attribute__((unused)))
@@ -1095,6 +1089,150 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr,
 	if (result == CUDA_SUCCESS) remove_cuda_allocation(dptr);
 
 	return result;
+}
+
+
+struct cuda_symbol {
+	const char *name;
+	void **real;
+	int required;
+	void *hook;
+	const char *proc;
+};
+
+#define REAL(fn) ((void **)&real_##fn)
+
+static const struct cuda_symbol cuda_symbols[] = {
+	{"cuCtxSynchronize", REAL(cuCtxSynchronize), 1, NULL, NULL},
+	{"cuMemAllocManaged", REAL(cuMemAllocManaged), 1, NULL, NULL},
+	{"cuGetErrorString", REAL(cuGetErrorString), 1, NULL, NULL},
+	{"cuGetErrorName", REAL(cuGetErrorName), 1, NULL, NULL},
+	{"cuCtxSetCurrent", REAL(cuCtxSetCurrent), 1, NULL, NULL},
+	{"cuCtxGetCurrent", REAL(cuCtxGetCurrent), 1, NULL, NULL},
+	{"cuDeviceGet", REAL(cuDeviceGet), 0, NULL, NULL},
+	{"cuDeviceTotalMem_v2", REAL(cuDeviceTotalMem), 0, NULL, NULL},
+	{"cuStreamIsCapturing", REAL(cuStreamIsCapturing), 0, NULL, NULL},
+
+	{"cuInit", REAL(cuInit), 1, cuInit, "cuInit"},
+	{"cuGetProcAddress", REAL(cuGetProcAddress), 0, cuGetProcAddress, NULL},
+	{"cuGetProcAddress_v2", REAL(cuGetProcAddress_v2), 0, cuGetProcAddress_v2, NULL},
+	{"cuMemAlloc_v2", NULL, 0, cuMemAlloc, "cuMemAlloc"},
+	{"cuMemFree_v2", REAL(cuMemFree), 1, cuMemFree, "cuMemFree"},
+	{"cuMemGetInfo_v2", REAL(cuMemGetInfo), 1, cuMemGetInfo, "cuMemGetInfo"},
+	{"cuMemAllocAsync", REAL(cuMemAllocAsync), 1, cuMemAllocAsync, "cuMemAllocAsync"},
+	{"cuMemFreeAsync", REAL(cuMemFreeAsync), 1, cuMemFreeAsync, "cuMemFreeAsync"},
+
+	{"cuLaunchKernel", REAL(cuLaunchKernel), 1, cuLaunchKernel, "cuLaunchKernel"},
+	{"cuMemcpy", REAL(cuMemcpy), 1, cuMemcpy, "cuMemcpy"},
+	{"cuMemcpyAsync", REAL(cuMemcpyAsync), 1, cuMemcpyAsync, "cuMemcpyAsync"},
+	{"cuMemcpyDtoH_v2", REAL(cuMemcpyDtoH), 1, cuMemcpyDtoH, "cuMemcpyDtoH"},
+	{"cuMemcpyDtoHAsync_v2", REAL(cuMemcpyDtoHAsync), 1, cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync"},
+	{"cuMemcpyHtoD_v2", REAL(cuMemcpyHtoD), 1, cuMemcpyHtoD, "cuMemcpyHtoD"},
+	{"cuMemcpyHtoDAsync_v2", REAL(cuMemcpyHtoDAsync), 1, cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync"},
+	{"cuMemcpyDtoD_v2", REAL(cuMemcpyDtoD), 1, cuMemcpyDtoD, "cuMemcpyDtoD"},
+	{"cuMemcpyDtoDAsync_v2", REAL(cuMemcpyDtoDAsync), 1, cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync"},
+
+	{"cuLaunchKernel_ptsz", REAL(cuLaunchKernel_ptsz), 0, cuLaunchKernel_ptsz, NULL},
+	{"cuMemcpy_ptds", REAL(cuMemcpy_ptds), 0, cuMemcpy_ptds, NULL},
+	{"cuMemcpyAsync_ptsz", REAL(cuMemcpyAsync_ptsz), 0, cuMemcpyAsync_ptsz, NULL},
+	{"cuMemcpyDtoH_v2_ptds", REAL(cuMemcpyDtoH_v2_ptds), 0, cuMemcpyDtoH_v2_ptds, NULL},
+	{"cuMemcpyDtoHAsync_v2_ptsz", REAL(cuMemcpyDtoHAsync_v2_ptsz), 0, cuMemcpyDtoHAsync_v2_ptsz, NULL},
+	{"cuMemcpyHtoD_v2_ptds", REAL(cuMemcpyHtoD_v2_ptds), 0, cuMemcpyHtoD_v2_ptds, NULL},
+	{"cuMemcpyHtoDAsync_v2_ptsz", REAL(cuMemcpyHtoDAsync_v2_ptsz), 0, cuMemcpyHtoDAsync_v2_ptsz, NULL},
+	{"cuMemcpyDtoD_v2_ptds", REAL(cuMemcpyDtoD_v2_ptds), 0, cuMemcpyDtoD_v2_ptds, NULL},
+	{"cuMemcpyDtoDAsync_v2_ptsz", REAL(cuMemcpyDtoDAsync_v2_ptsz), 0, cuMemcpyDtoDAsync_v2_ptsz, NULL},
+
+	{"cuLaunchKernelEx", REAL(cuLaunchKernelEx), 0, cuLaunchKernelEx, NULL},
+	{"cuLaunchKernelEx_ptsz", REAL(cuLaunchKernelEx_ptsz), 0, cuLaunchKernelEx_ptsz, NULL},
+	{"cuLaunchCooperativeKernel", REAL(cuLaunchCooperativeKernel), 0, cuLaunchCooperativeKernel, NULL},
+	{"cuLaunchCooperativeKernel_ptsz", REAL(cuLaunchCooperativeKernel_ptsz), 0, cuLaunchCooperativeKernel_ptsz, NULL},
+	{"cuGraphLaunch", REAL(cuGraphLaunch), 0, cuGraphLaunch, NULL},
+	{"cuGraphLaunch_ptsz", REAL(cuGraphLaunch_ptsz), 0, cuGraphLaunch_ptsz, NULL},
+	{"cuStreamBeginCapture", REAL(cuStreamBeginCapture), 0, cuStreamBeginCapture, NULL},
+	{"cuStreamBeginCapture_ptsz", REAL(cuStreamBeginCapture_ptsz), 0, cuStreamBeginCapture_ptsz, NULL},
+	{"cuStreamBeginCapture_v2", REAL(cuStreamBeginCapture_v2), 0, cuStreamBeginCapture_v2, NULL},
+	{"cuStreamBeginCapture_v2_ptsz", REAL(cuStreamBeginCapture_v2_ptsz), 0, cuStreamBeginCapture_v2_ptsz, NULL},
+	{"cuStreamBeginCaptureToGraph", REAL(cuStreamBeginCaptureToGraph), 0, cuStreamBeginCaptureToGraph, NULL},
+	{"cuStreamBeginCaptureToGraph_ptsz", REAL(cuStreamBeginCaptureToGraph_ptsz), 0, cuStreamBeginCaptureToGraph_ptsz, NULL},
+	{"cuStreamEndCapture", REAL(cuStreamEndCapture), 0, cuStreamEndCapture, NULL},
+	{"cuStreamEndCapture_ptsz", REAL(cuStreamEndCapture_ptsz), 0, cuStreamEndCapture_ptsz, NULL},
+};
+
+#define CUDA_SYMBOLS_END \
+	(cuda_symbols + sizeof(cuda_symbols) / sizeof(cuda_symbols[0]))
+
+static void load_cuda_symbols(void *cuda_handle)
+{
+	const struct cuda_symbol *sym;
+	void *addr;
+	char *error;
+
+	for (sym = cuda_symbols; sym < CUDA_SYMBOLS_END; sym++) {
+		if (sym->real == NULL) continue;
+		/*
+		 * For dlsym(), a return value of NULL does not necessarily
+		 * indicate an error. Therefore, we must:
+		 *  1. clear the previous error state by calling dlerror()
+		 *  2. call dlsym()
+		 *  3. call dlerror()
+		 * If the value which dlerror() returns is not NULL, an error
+		 * occured.
+		 */
+		dlerror();
+		addr = real_dlsym_225(cuda_handle, sym->name);
+		error = dlerror();
+		if (error != NULL) {
+			if (sym->required) log_fatal("%s", error);
+			/*
+			 * This symbol may not be used. Older drivers lack the
+			 * newer functions.
+			 */
+			log_debug("%s", error);
+			addr = NULL;
+		}
+		memcpy(sym->real, &addr, sizeof(addr));
+	}
+}
+
+static void *hook_for_symbol(const char *symbol)
+{
+	const struct cuda_symbol *sym;
+	void *real;
+
+	if (strncmp(symbol, "cu", 2) != 0) return NULL;
+	for (sym = cuda_symbols; sym < CUDA_SYMBOLS_END; sym++) {
+		if (sym->hook == NULL || strcmp(symbol, sym->name) != 0)
+			continue;
+		if (libcuda_base != NULL && sym->real != NULL) {
+			memcpy(&real, sym->real, sizeof(real));
+			if (real == NULL) return NULL;
+		}
+		return sym->hook;
+	}
+	return NULL;
+}
+
+static void *hook_for_proc(const char *symbol)
+{
+	const struct cuda_symbol *sym;
+
+	for (sym = cuda_symbols; sym < CUDA_SYMBOLS_END; sym++)
+		if (sym->proc != NULL && strcmp(symbol, sym->proc) == 0)
+			return sym->hook;
+	return NULL;
+}
+
+static void *hook_for_real(void *fn)
+{
+	const struct cuda_symbol *sym;
+	void *real;
+
+	for (sym = cuda_symbols; sym < CUDA_SYMBOLS_END; sym++) {
+		if (sym->hook == NULL || sym->real == NULL) continue;
+		memcpy(&real, sym->real, sizeof(real));
+		if (real == fn) return sym->hook;
+	}
+	return NULL;
 }
 
 

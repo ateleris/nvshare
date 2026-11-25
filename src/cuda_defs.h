@@ -47,6 +47,7 @@
 #define nvmlDeviceGetHandleByIndex  nvmlDeviceGetHandleByIndex_v2
 
 #include <stdint.h>
+#include <pthread.h>
 
 typedef uint64_t cuuint64_t;
 typedef unsigned long long CUdeviceptr_v2;
@@ -57,12 +58,40 @@ typedef int CUdevice;
 typedef struct CUctx_st *CUcontext;
 typedef struct CUstream_st *CUstream;
 typedef struct CUfunc_st *CUfunction;
+typedef struct CUgraph_st *CUgraph;
+typedef struct CUgraphNode_st *CUgraphNode;
+typedef struct CUgraphExec_st *CUgraphExec;
+typedef struct CUgraphEdgeData_st CUgraphEdgeData;
+typedef struct CUlaunchAttribute_st CUlaunchAttribute;
+typedef int CUstreamCaptureMode;
+
+typedef struct CUlaunchConfig_st {
+	unsigned int gridDimX;
+	unsigned int gridDimY;
+	unsigned int gridDimZ;
+	unsigned int blockDimX;
+	unsigned int blockDimY;
+	unsigned int blockDimZ;
+	unsigned int sharedMemBytes;
+	CUstream hStream;
+	CUlaunchAttribute *attrs;
+	unsigned int numAttrs;
+} CUlaunchConfig;
+
+typedef enum CUstreamCaptureStatus_enum {
+	CU_STREAM_CAPTURE_STATUS_NONE = 0,
+	CU_STREAM_CAPTURE_STATUS_ACTIVE = 1,
+	CU_STREAM_CAPTURE_STATUS_INVALIDATED = 2,
+} CUstreamCaptureStatus;
+
+#define CU_STREAM_PER_THREAD ((CUstream)0x2)
 typedef struct nvmlDevice_st* nvmlDevice_t;
 
 typedef enum cuda_drv_error_enum {
 	CUDA_SUCCESS               = 0,
 	CUDA_ERROR_OUT_OF_MEMORY   = 2,
 	CUDA_ERROR_NOT_INITIALIZED = 3,
+	CUDA_ERROR_STREAM_CAPTURE_INVALIDATED = 901,
 	CUDA_ERROR_UNKNOWN         = 999
 } CUresult;
 
@@ -148,6 +177,23 @@ typedef CUresult (*cuMemcpyDtoDAsync_func)(CUdeviceptr dstDevice,
 typedef CUresult (*cuMemAllocAsync_func)(CUdeviceptr *dptr, size_t bytesize,
 	CUstream hStream);
 typedef CUresult (*cuMemFreeAsync_func)(CUdeviceptr dptr, CUstream hStream);
+typedef CUresult (*cuLaunchKernelEx_func)(const CUlaunchConfig *config,
+	CUfunction f, void **kernelParams, void **extra);
+typedef CUresult (*cuLaunchCooperativeKernel_func)(CUfunction f,
+	unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+	unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+	unsigned int sharedMemBytes, CUstream hStream, void **kernelParams);
+typedef CUresult (*cuGraphLaunch_func)(CUgraphExec hGraphExec, CUstream hStream);
+typedef CUresult (*cuStreamBeginCapture_func)(CUstream hStream);
+typedef CUresult (*cuStreamBeginCapture_v2_func)(CUstream hStream,
+	CUstreamCaptureMode mode);
+typedef CUresult (*cuStreamBeginCaptureToGraph_func)(CUstream hStream,
+	CUgraph hGraph, const CUgraphNode *dependencies,
+	const CUgraphEdgeData *dependencyData, size_t numDependencies,
+	CUstreamCaptureMode mode);
+typedef CUresult (*cuStreamEndCapture_func)(CUstream hStream, CUgraph *phGraph);
+typedef CUresult (*cuStreamIsCapturing_func)(CUstream hStream,
+	CUstreamCaptureStatus *captureStatus);
 
 typedef nvmlReturn_t (*nvmlDeviceGetUtilizationRates_func)(nvmlDevice_t device,
 	nvmlUtilization_t *utilization);
@@ -227,6 +273,10 @@ extern CUcontext cuda_ctx;
 
 extern int nvml_ok;
 extern size_t sum_allocated;
+
+extern pthread_mutex_t capture_mutex;
+extern pthread_cond_t capture_cv;
+extern int active_captures;
 
 #endif /* _CUDA_DEFS_H */
 

@@ -71,20 +71,24 @@ uint64_t nvshare_generate_id(void) {
 }
 
 
+const char *nvshare_sock_dir(void)
+{
+	const char *dir = getenv(ENV_NVSHARE_SOCK_DIR);
+
+	return (dir != NULL && *dir != '\0') ? dir : NVSHARE_SOCK_DIR;
+}
+
+
 /* Stores the path to the nvshare-scheduler socket in sock_path. */
 int nvshare_get_scheduler_path(char *sock_path)
 {
-	int offset;
-	size_t ret;
-	
-	/* TODO: Ensure it fits in sock_path, check return value */
-	ret = strlcpy(sock_path, NVSHARE_SOCK_DIR, NVSHARE_SOCK_PATH_MAX);
+	const char *dir = nvshare_sock_dir();
+	int ret;
 
-	offset = ret; /* Start from the trailing NULL byte */
-
-	/* TODO: Ensure it fits in sock_path, check return value */
-	ret = snprintf(sock_path + offset, NVSHARE_SOCK_PATH_MAX - offset,
-			"%s", "scheduler.sock");
+	ret = snprintf(sock_path, NVSHARE_SOCK_PATH_MAX, "%s%sscheduler.sock",
+		       dir, dir[strlen(dir) - 1] == '/' ? "" : "/");
+	if (ret < 0 || (size_t)ret >= NVSHARE_SOCK_PATH_MAX)
+		return -1;
 	return 0;
 }
 

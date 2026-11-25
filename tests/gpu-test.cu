@@ -91,21 +91,25 @@ static double seconds_between(std::chrono::steady_clock::time_point a,
 
 static void usage(const char *prog)
 {
-    printf("usage: %s [--mem-mib N] [--seconds N]\n"
+    printf("usage: %s [--mem-mib N] [--seconds N] [--graph]\n"
            "  --mem-mib N   GPU memory to allocate and keep in use (default 1024)\n"
-           "  --seconds N   how long to run the workload (default 60)\n",
+           "  --seconds N   how long to run the workload (default 60)\n"
+           "  --graph       capture every pass into a CUDA graph and launch that\n",
            prog);
 }
 
 int main(int argc, char **argv)
 {
     long mem_mib = 1024, seconds = 60;
+    bool use_graph = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mem-mib") && i + 1 < argc) {
             mem_mib = atol(argv[++i]);
         } else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) {
             seconds = atol(argv[++i]);
+        } else if (!strcmp(argv[i], "--graph")) {
+            use_graph = true;
         } else {
             usage(argv[0]);
             return strcmp(argv[i], "--help") ? 2 : 0;
@@ -131,13 +135,17 @@ int main(int argc, char **argv)
            total_bytes >> 20, free_bytes >> 20);
     printf("libnvshare loaded: %s\n",
            nvshare_loaded() ? "yes" : "NO (running without nvshare)");
-    printf("config: %ld MiB, %ld s\n", mem_mib, seconds);
+    printf("config: %ld MiB, %ld s%s\n", mem_mib, seconds,
+           use_graph ? ", cuda graphs" : "");
 
     uint32_t *buf;
     unsigned int *bad_dev;
     unsigned int bad = 0;
     CHECK(cudaMalloc(&buf, n * sizeof(uint32_t)));
     CHECK(cudaMalloc(&bad_dev, sizeof(bad)));
+
+    cudaStream_t stream;
+    CHECK(cudaStreamCreate(&stream));
 
     auto start = std::chrono::steady_clock::now();
     init_kernel<<<blocks, THREADS>>>(buf, n);
@@ -151,28 +159,46 @@ int main(int argc, char **argv)
     uint64_t passes = 0, window_passes = 0, launches = 0, waits = 0;
     double fastest = 0, waited = 0, longest = 0;
 
+    auto timed = [&](std::chrono::steady_clock::time_point t0) {
+        auto t1 = std::chrono::steady_clock::now();
+        double d = seconds_between(t0, t1);
+        launches++;
+        if (launches == 1 || d < fastest) fastest = d;
+        if (d >= MIN_WAIT_SECONDS && d >= WAIT_FACTOR * fastest) {
+            waits++;
+            waited += d;
+            if (d > longest) longest = d;
+            printf("[%6.1fs] waited %.1f s for the gpu\n",
+                   seconds_between(start, t1), d);
+        }
+    };
+
     while (!stop_requested &&
            seconds_between(loop_start, std::chrono::steady_clock::now()) < seconds) {
+        cudaGraph_t graph;
+        cudaGraphExec_t graph_exec;
+        auto pass_start = std::chrono::steady_clock::now();
+
+        if (use_graph) CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
         for (size_t off = 0; off < n; off += CHUNK) {
             size_t len = n - off < CHUNK ? n - off : CHUNK;
             unsigned int chunk_blocks = (unsigned int)((len + THREADS - 1) / THREADS);
 
             auto t0 = std::chrono::steady_clock::now();
-            step_kernel<<<chunk_blocks, THREADS>>>(buf + off, len);
+            step_kernel<<<chunk_blocks, THREADS, 0, stream>>>(buf + off, len);
             CHECK(cudaGetLastError());
-            CHECK(cudaDeviceSynchronize());
-            auto t1 = std::chrono::steady_clock::now();
-
-            double d = seconds_between(t0, t1);
-            launches++;
-            if (launches == 1 || d < fastest) fastest = d;
-            if (d >= MIN_WAIT_SECONDS && d >= WAIT_FACTOR * fastest) {
-                waits++;
-                waited += d;
-                if (d > longest) longest = d;
-                printf("[%6.1fs] waited %.1f s for the gpu\n",
-                       seconds_between(start, t1), d);
-            }
+            if (use_graph) continue;
+            CHECK(cudaStreamSynchronize(stream));
+            timed(t0);
+        }
+        if (use_graph) {
+            CHECK(cudaStreamEndCapture(stream, &graph));
+            CHECK(cudaGraphInstantiate(&graph_exec, graph, 0));
+            CHECK(cudaGraphLaunch(graph_exec, stream));
+            CHECK(cudaStreamSynchronize(stream));
+            CHECK(cudaGraphExecDestroy(graph_exec));
+            CHECK(cudaGraphDestroy(graph));
+            timed(pass_start);
         }
         passes++;
         window_passes++;

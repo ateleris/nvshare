@@ -285,7 +285,13 @@ sudo install nvsharectl /usr/local/bin/
 
 ### Test
 
-`tests/gpu-e2e.sh` starts a scheduler and runs two GPU workloads against it, twice: first they must hold the lock at the same time, then, with parallel use turned off, they must take turns. It is the test CI runs on a real GPU. It needs the three binaries and the `gpu-test` workload in one directory:
+`tests/client-e2e.sh` tests `libnvshare` without a GPU. It runs a scripted application against a fake CUDA driver and a real scheduler, and checks that every kind of GPU work waits for the lock, that CUDA graph captures survive, and that the memory reports arrive. It needs `gcc` and `make`, and no root:
+
+```bash
+tests/client-e2e.sh
+```
+
+`tests/gpu-e2e.sh` starts a scheduler and runs two GPU workloads against it, twice: first they must hold the lock at the same time, then, with parallel use turned off, they must take turns. One of the two workloads builds and launches CUDA graphs. It is the test CI runs on a real GPU. It needs the three binaries and the `gpu-test` workload in one directory:
 
 ```bash
 mkdir bin && cp src/libnvshare.so src/nvshare-scheduler src/nvsharectl bin/
@@ -321,6 +327,7 @@ Environment variables of the scheduler and the device plugin:
 | `NVSHARE_DEBUG=1` | scheduler | Print debug logs. |
 | `NVSHARE_TQ` | scheduler | Time quantum in seconds at startup, 30 by default. `nvsharectl -T` changes it until the next restart. |
 | `NVSHARE_PARALLEL=0` | scheduler | Start with parallel use turned off. `nvsharectl -P` changes it until the next restart. |
+| `NVSHARE_SOCK_DIR` | scheduler, application | Directory of the scheduler socket, `/var/run/nvshare` by default. The scheduler and its applications need the same value. Meant for tests: the device plugin always uses the default. |
 | `NVSHARE_VIRTUAL_DEVICES` | device plugin | Number of `nvshare.com/gpu` devices to offer per GPU. Required, 10 in the provided manifest. |
 | `NVSHARE_METRICS_PORT` | device plugin | Port of the metrics endpoint, 8080 by default. |
 
